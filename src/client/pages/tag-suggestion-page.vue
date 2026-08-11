@@ -23,6 +23,8 @@ const {
     is_dark_theme,
     has_records,
     pending_count,
+    analyze_done,
+    analyze_total,
     messages,
     load,
     run_analyze,
@@ -55,7 +57,11 @@ function format_confidence(value: number): string {
         <v-spacer />
         <span v-if="props.user_id" class="signed_in_user mr-3">{{ props.user_id }}</span>
         <span class="pending_count mr-2">確認待ち {{ pending_count }}件</span>
-        <v-tooltip text="解析する">
+        <!-- 解析は数十分かかることがある。走っている間は何件目かを出す。 -->
+        <span v-if="is_analyzing" class="analyze_progress mr-2">
+            解析中 {{ analyze_total > 0 ? `${analyze_done} / ${analyze_total}` : '準備中' }}
+        </span>
+        <v-tooltip :text="is_analyzing ? '解析しています' : '解析する'">
             <template v-slot:activator="{ props: tooltip_props }">
                 <v-btn v-bind="tooltip_props" icon="mdi-refresh" :loading="is_analyzing"
                     :disabled="!props.is_analyzable" @click="run_analyze()" />
@@ -120,6 +126,15 @@ function format_confidence(value: number): string {
                         <!-- 画像は自分のサーバが gkill から取り寄せて中継する。
                              ディスクには残さない。 -->
                         <img :src="focused_record.thumb_url" class="record_image" alt="記録の写真" />
+                    </div>
+
+                    <!-- 画像でないファイルの記録。写真も本文も持たないので、
+                         出さないと日時と種別しか載らない空の札になる。
+                         gkill は画像以外のサムネイルを作らないため、
+                         ここでプレビューを出すことはできない。 -->
+                    <div v-else-if="focused_record.file_name" class="record_file_wrap">
+                        <v-icon size="32" color="primary">mdi-file-outline</v-icon>
+                        <span class="record_file_name">{{ focused_record.file_name }}</span>
                     </div>
 
                     <v-card-text>
@@ -223,6 +238,19 @@ function format_confidence(value: number): string {
     object-fit: contain;
 }
 
+/* 画像でないファイルの記録。プレビューの代わりに名前を出す。 */
+.record_file_wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px;
+    background-color: rgb(var(--v-theme-background-focused));
+}
+
+.record_file_name {
+    word-break: break-all;
+}
+
 .record_text {
     white-space: pre-wrap;
     word-break: break-word;
@@ -264,6 +292,12 @@ function format_confidence(value: number): string {
 
 .pending_count {
     font-size: 0.9rem;
+}
+
+/* 解析の進み具合。件数だけを出す(記録の中身は出さない)。 */
+.analyze_progress {
+    font-size: 0.9rem;
+    white-space: nowrap;
 }
 
 /* 誰として見ているか。複数のアカウントを行き来するときの取り違え防止。 */

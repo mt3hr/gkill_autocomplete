@@ -6,6 +6,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -13,9 +14,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/classify"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/config"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/gkillclient"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/ids"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/llm"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/store"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/suggest"
 )
@@ -98,11 +101,41 @@ type AnalyzeReport struct {
 	StoredSuggestions int
 	// SkippedByVerdict は過去の判定により保存しなかった提案の数。
 	SkippedByVerdict int
-	Elapsed          time.Duration
+	// FailedRecords は判定に失敗して飛ばした記録の数。
+	//
+	// **これが0でないことは異常ではあるが、解析の失敗ではない。**
+	// LLM の応答が解釈できない・写真が取れない・1件が時間切れになる、
+	// といったことは実際に起きる。1件のために残り全部を捨てるほうが害が大きい。
+	FailedRecords int
+	// FailureReason は最も多かった失敗の理由。
+	//
+	// **決め打ちの文字列しか入らない。** エラー本文には LLM の応答や
+	// 記録の中身が混ざりうるので、そのままは載せない。
+	// これが無いと、全件失敗しても件数しか分からず原因に辿り着けない。
+	FailureReason string
+	Elapsed       time.Duration
+}
+
+// Progress は解析の途中経過。
+//
+// 画面に「何件目か」を出すためだけのもの。記録の中身は入れない。
+type Progress struct {
+	// Done は判定を終えた記録の数(失敗して飛ばしたものも含む)。
+	Done int
+	// Total は判定する記録の総数。
+	Total int
 }
 
 // Analyze はまだタグの付いていない記録に対する提案を作る。
 func (a *App) Analyze(ctx context.Context) (AnalyzeReport, error) {
+	return a.AnalyzeWithProgress(ctx, nil)
+}
+
+// AnalyzeWithProgress は途中経過を知らせながら解析する。
+//
+// onProgress は記録を1件片付けるたびに呼ばれる。nil でよい。
+// **呼び出しは解析と同じゴルーチンで行うので、中で待たせないこと。**
+func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)) (AnalyzeReport, error) {
 	startedAt := a.now()
 	report := AnalyzeReport{}
 
@@ -127,6 +160,9 @@ func (a *App) Analyze(ctx context.Context) (AnalyzeReport, error) {
 		slog.Int("学習した記録", report.LearnedRecords),
 		slog.Int("判定する記録", report.CandidateRecords))
 
+	// 総数が決まった時点で1回知らせる。画面はここで初めて分母を出せる。
+	a.notifyProgress(onProgress, 0, len(candidates))
+
 	engine := suggest.NewEngine(knowledge, a.Config, a.Classifier)
 
 	// 近傍の記録を引くために時刻順に並べておく。
@@ -136,12 +172,45 @@ func (a *App) Analyze(ctx context.Context) (AnalyzeReport, error) {
 	})
 	window := a.Config.Scoring.NeighborWindow()
 
-	for _, candidate := range candidates {
+	// 失敗の理由ごとの件数。決め打ちの文字列だけを鍵にする。
+	failureCounts := map[string]int{}
+
+	for index, candidate := range candidates {
+		// 中断は中断として扱う。利用者が止めたか、終了しようとしている。
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+
 		neighbors := neighborsOf(sorted, candidate, window)
 
 		result, err := engine.Suggest(ctx, candidate, neighbors)
 		if err != nil {
-			return report, fmt.Errorf("error at suggest for record: %w", err)
+			// **1件の失敗で残り全部を捨てない。**
+			// 判定は記録ごとに独立しているので、失敗した1件を飛ばせば済む。
+			// 落としてしまうと、後ろに並んでいる何十件もの記録が
+			// 「解析が途中で止まった」という形で永久に処理されなくなる。
+			//
+			// 飛ばした記録は評価済みにしない。次に解析すればまた対象になる。
+			if ctx.Err() != nil {
+				return report, ctx.Err()
+			}
+			report.FailedRecords++
+
+			// 記録の中身が混ざるので、エラー本文はログに出さない。
+			// 代わりに決め打ちの理由へ落として数える。
+			reason := failureReasonOf(err)
+			failureCounts[reason]++
+
+			// 同じ理由は最初の1回だけ出す。全件失敗したときに
+			// 同じ行が千行並んでも、原因に近づかないため。
+			if failureCounts[reason] == 1 {
+				a.logger().Warn("記録の判定に失敗したため飛ばしました。次の解析でやり直します",
+					slog.String("理由", reason),
+					slog.Int("何件目", index+1),
+					slog.Int("判定する記録", len(candidates)))
+			}
+			a.notifyProgress(onProgress, index+1, len(candidates))
+			continue
 		}
 
 		if len(result.Suggestions) == 0 {
@@ -177,17 +246,91 @@ func (a *App) Analyze(ctx context.Context) (AnalyzeReport, error) {
 		if err := a.Store.MarkEvaluated(ctx, a.UserID(), candidate.ID, result.Tier, a.now()); err != nil {
 			return report, err
 		}
+
+		a.notifyProgress(onProgress, index+1, len(candidates))
 	}
 
+	report.FailureReason = mostCommonReason(failureCounts)
 	report.Elapsed = a.now().Sub(startedAt)
 
 	a.logger().Info("解析が終わりました",
 		slog.Int("提案が出た記録", report.SuggestedRecords),
 		slog.Int("提案が出なかった記録", report.NoSuggestionRecords),
 		slog.Int("保存した提案", report.StoredSuggestions),
+		slog.Int("判定に失敗した記録", report.FailedRecords),
 		slog.Duration("所要時間", report.Elapsed))
 
+	a.warnAboutFailures(report)
 	return report, nil
+}
+
+// warnAboutFailures は判定に失敗した記録があったことを知らせる。
+//
+// **全件失敗と一部失敗は別のことなので、別の言い方をする。**
+// 全件失敗は接続先か設定の問題で、記録を1件ずつ疑っても直らない。
+func (a *App) warnAboutFailures(report AnalyzeReport) {
+	if report.FailedRecords == 0 {
+		return
+	}
+
+	if report.FailedRecords == report.CandidateRecords {
+		a.logger().Error(
+			"判定する記録がすべて失敗しました。個々の記録ではなく、接続先か設定の問題です。"+
+				"提案は1件も作られていません",
+			slog.String("理由", report.FailureReason),
+			slog.Int("判定する記録", report.CandidateRecords))
+		return
+	}
+
+	a.logger().Warn(
+		"判定に失敗した記録があります。飛ばして先へ進めたので解析そのものは完走しています。"+
+			"飛ばした記録は評価済みにしていないので、次の解析でやり直されます",
+		slog.String("最も多かった理由", report.FailureReason),
+		slog.Int("判定に失敗した記録", report.FailedRecords),
+		slog.Int("判定する記録", report.CandidateRecords))
+}
+
+// failureReasonOf は判定の失敗を、記録の中身を含まない短い理由に落とす。
+//
+// **エラー本文をそのまま使ってはいけない。** LLM の応答にも写真の取得失敗にも
+// 記録の中身が混ざりうるため、ここで決め打ちの文字列に置き換える。
+// 理由には「次に何をすればよいか」まで入れる。件数だけでは動けない。
+func failureReasonOf(err error) string {
+	switch {
+	case errors.Is(err, llm.ErrUnreachable):
+		return "LLM に繋がらない (起動しているか、設定の llm.endpoint が合っているかを確かめてください)"
+	case errors.Is(err, llm.ErrTimeout):
+		return "LLM が時間切れ (llm.timeout_seconds を延ばすか、llm.thumb_size を小さくしてください)"
+	case errors.Is(err, llm.ErrRejected):
+		return "LLM がエラーを返した (モデル名と文脈長を確かめてください)"
+	case errors.Is(err, llm.ErrBadResponse):
+		return "LLM の応答を解釈できない"
+	case errors.Is(err, gkillclient.ErrNotAnImage):
+		return "画像でないファイルを画像として判定しようとした"
+	case errors.Is(err, classify.ErrImageUnavailable):
+		return "判定する写真を gkill から取得できない"
+	default:
+		return "その他"
+	}
+}
+
+// mostCommonReason は最も多かった理由を返す。同数のときは名前で安定させる。
+func mostCommonReason(counts map[string]int) string {
+	best, bestCount := "", 0
+	for reason, count := range counts {
+		if count > bestCount || (count == bestCount && reason < best) {
+			best, bestCount = reason, count
+		}
+	}
+	return best
+}
+
+// notifyProgress は途中経過を知らせる。onProgress が nil なら何もしない。
+func (a *App) notifyProgress(onProgress func(Progress), done int, total int) {
+	if onProgress == nil {
+		return
+	}
+	onProgress(Progress{Done: done, Total: total})
 }
 
 // fetchRecords は学習範囲の記録を取る。

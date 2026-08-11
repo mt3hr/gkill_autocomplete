@@ -447,11 +447,73 @@ func TestAnalyzeEndpointReturnsReport(t *testing.T) {
 		t.Fatalf("HTTP %d: %s", recorder.Code, recorder.Body.String())
 	}
 
-	response := analyzeResponse{}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-		t.Fatalf("応答を解釈できない: %v", err)
+	// 解析はリクエストとは別の寿命で走る。終わるのを待ってから中身を見る。
+	response := waitAnalyzeFinished(t, server)
+	if response.Failure != "" {
+		t.Fatalf("解析が落ちた: %s", response.Failure)
 	}
-	if response.LearnedRecords != 1 {
-		t.Errorf("学習した記録 = %d件, want 1件", response.LearnedRecords)
+	if response.Report == nil {
+		t.Fatal("解析の結果が返らない")
 	}
+	if response.Report.LearnedRecords != 1 {
+		t.Errorf("学習した記録 = %d件, want 1件", response.Report.LearnedRecords)
+	}
+}
+
+// TestAnalyzeKeepsRunningAfterRequestIsCancelled は、要求が切れても
+// 解析が続くことを確かめる。
+//
+// **これを落とすと、タブを閉じただけで解析が止まる作りに戻る。**
+// 写真の判定は1件で数分かかるので、1本の要求の寿命に縛ってはいけない。
+func TestAnalyzeKeepsRunningAfterRequestIsCancelled(t *testing.T) {
+	fake := newFakeGkill(t, []map[string]any{
+		kyouJSON("past-1", map[string]any{"kind": "kmemo", "content": "定型の本文"}),
+	})
+	server, _ := newTestServer(t, fake)
+
+	// 途中で切れる文脈で解析を頼む。
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/api/analyze", strings.NewReader("{}"))
+	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(loginCookie(t, server))
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request.WithContext(cancelledCtx))
+	cancel()
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	response := waitAnalyzeFinished(t, server)
+	if response.Failure != "" {
+		t.Fatalf("要求が切れたせいで解析が落ちている: %s", response.Failure)
+	}
+	if response.Report == nil {
+		t.Fatal("解析の結果が返らない")
+	}
+}
+
+// waitAnalyzeFinished は解析が終わるまで状態を見に行く。
+func waitAnalyzeFinished(t *testing.T, server *Server) analyzeStatusResponse {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		recorder := doGet(t, server, "/api/analyze/status")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("HTTP %d: %s", recorder.Code, recorder.Body.String())
+		}
+
+		response := analyzeStatusResponse{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("応答を解釈できない: %v", err)
+		}
+		if !response.Running && (response.Report != nil || response.Failure != "") {
+			return response
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatal("解析が終わらない")
+	return analyzeStatusResponse{}
 }

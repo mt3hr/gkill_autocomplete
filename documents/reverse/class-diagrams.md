@@ -430,7 +430,8 @@ classDiagram
         +logout()
         +fetch_suggestions() SuggestionsResponse
         +decide(target_id, approve_tags)
-        +analyze()
+        +start_analyze() AnalyzeStatus
+        +fetch_analyze_status() AnalyzeStatus
         -password_sha256(password) string
     }
 

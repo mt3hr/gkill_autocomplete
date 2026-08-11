@@ -2,6 +2,7 @@ package gkillclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,6 +51,14 @@ func escapePathSegments(path string) string {
 	}
 	return strings.Join(escaped, "/")
 }
+
+// ErrNotAnImage は画像でないものが返ってきたことを表す。
+//
+// **gkill の ?thumb= は画像以外のファイルにエラーを返さない。**
+// 拡張子がサムネイルの対象でなければ、サムネイル生成を素通りして
+// 原本をそのまま 200 で返す。動画・書庫・書類のいずれでも起きる。
+// 素通しにすると、動画1本を maxImageBytes まで読み込むことになる。
+var ErrNotAnImage = errors.New("gkill が画像でないものを返しました")
 
 // Image は取得した画像。
 type Image struct {
@@ -122,14 +131,26 @@ func (c *Client) fetchFile(ctx context.Context, requestURL string, sessionID str
 		return Image{}, response.StatusCode, nil
 	}
 
+	contentType := response.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	// **画像でなければ本文を読まない。**
+	// ?thumb= は画像以外に対してエラーを返さず原本をそのまま寄越すので、
+	// 読み切ると動画や書類の全量をメモリに載せることになる。
+	// ファイル名は伏せる(エラーはログにも出るため)。
+	if !strings.HasPrefix(contentType, "image/") {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBodyBytes))
+		return Image{}, http.StatusOK, fmt.Errorf(
+			"%w (Content-Type %q)。?thumb= は画像以外のファイルにはエラーを返さず、"+
+				"サムネイルを作らずに原本をそのまま返します", ErrNotAnImage, contentType)
+	}
+
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxImageBytes))
 	if err != nil {
 		return Image{}, 0, fmt.Errorf("error at read file body: %w", err)
 	}
 
-	contentType := response.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
 	return Image{Bytes: body, ContentType: contentType}, http.StatusOK, nil
 }

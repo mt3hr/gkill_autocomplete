@@ -154,7 +154,7 @@ sequenceDiagram
 
     Note over CLI: --user で渡された利用者ID だけを持っている
 
-    CLI->>DB: セッションを1行書く(30分)
+    CLI->>DB: セッションを1行書く(1週間)
     Note over DB: ApplicationName は "gkill" 固定<br/>違うと gkill の認証が弾く
     DB-->>CLI: SessionID
 

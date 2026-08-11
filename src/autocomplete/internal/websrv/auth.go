@@ -20,7 +20,12 @@ const (
 	sessionCookieName = "gkill_autocomplete_session"
 
 	// sessionTTL はログイン状態の有効期間。
-	sessionTTL = 24 * time.Hour
+	//
+	// 確認画面は何日も上げたままにするので長く取る。
+	// **これはログインした端末に1週間ぶんの鍵が残るということ。**
+	// 画面に出るのは記録の本文と写真そのものなので、
+	// 共用の端末で開いたときは必ずログアウトすること。
+	sessionTTL = 7 * 24 * time.Hour
 
 	// loginAttemptLimit と loginAttemptWindow はログイン試行の制限。
 	//

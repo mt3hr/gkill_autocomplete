@@ -3,6 +3,7 @@ package gkillclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -316,5 +317,65 @@ func TestTLSAgainstPlainServerExplainsTheFix(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "平文") {
 		t.Errorf("直し方の案内が無い: %v", err)
+	}
+}
+
+// TestFetchThumbRejectsNonImage は、画像でないものが返ってきたら失敗にすることを確かめる。
+//
+// **gkill の ?thumb= は画像以外のファイルにエラーを返さない。**
+// 拡張子がサムネイルの対象でなければ、原本をそのまま 200 で返す。
+// 素通しにすると、動画をまるごとメモリに載せた上で LLM へ写真として渡すことになる。
+func TestFetchThumbRejectsNonImage(t *testing.T) {
+	for _, contentType := range []string{
+		"video/mp4",
+		"application/x-zip-compressed",
+		"text/html; charset=utf-8",
+		"application/octet-stream",
+	} {
+		t.Run(contentType, func(t *testing.T) {
+			served := false
+			client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				served = true
+				w.Header().Set("Content-Type", contentType)
+				w.WriteHeader(http.StatusOK)
+				// 本文を読み切らないことも確かめたいので大きめに書く。
+				_, _ = w.Write(make([]byte, 4<<20))
+			}))
+
+			image, err := client.FetchThumb(context.Background(), "SampleRep", "sample.mp4", "400x400")
+			if !served {
+				t.Fatal("サーバに届いていない")
+			}
+			if err == nil {
+				t.Fatalf("エラーにならなかった: %d バイト受け取った", len(image.Bytes))
+			}
+			if !errors.Is(err, ErrNotAnImage) {
+				t.Errorf("エラー = %v, want ErrNotAnImage", err)
+			}
+			if len(image.Bytes) != 0 {
+				t.Errorf("本文を %d バイト読んでいる。画像でないと分かった時点で読むのをやめること", len(image.Bytes))
+			}
+			// ファイル名は伏せること(このエラーはログにも出る)。
+			if strings.Contains(err.Error(), "sample.mp4") {
+				t.Errorf("エラーにファイル名が入っている: %v", err)
+			}
+		})
+	}
+}
+
+// TestFetchThumbAcceptsImage は、画像ならそのまま取れることを確かめる。
+func TestFetchThumbAcceptsImage(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{0xFF, 0xD8, 0xFF})
+	}))
+
+	image, err := client.FetchThumb(context.Background(), "SampleRep", "sample.jpg", "400x400")
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+	if len(image.Bytes) != 3 || image.ContentType != "image/jpeg" {
+		t.Errorf("画像 = %d バイト / %q", len(image.Bytes), image.ContentType)
 	}
 }

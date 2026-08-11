@@ -11,8 +11,10 @@ package classify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/gkillclient"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/llm"
@@ -29,7 +31,19 @@ const (
 	// 写真は文字よりはるかに嵩む。1枚で千数百トークンになるので、
 	// 文脈長の既定が 4096 のままの環境では2枚が上限に近い。
 	defaultMaxExampleImages = 2
+
+	// exampleThumbTimeout は見本写真1枚あたりの取得の期限。
+	//
+	// **見本は無くても判定はできる。** gkill 側の期限(既定120秒)を
+	// そのまま待つと、取れない見本1枚のために記録1件あたり数分溶ける。
+	// 判定する写真そのものは違うので、こちらの期限は掛けない。
+	exampleThumbTimeout = 15 * time.Second
 )
+
+// ErrImageUnavailable は判定する写真を取れなかったことを表す。
+//
+// 呼び出し側が errors.Is で見分けて、記録の中身を含まない理由に置き換える。
+var ErrImageUnavailable = errors.New("判定する写真を取得できません")
 
 // ImageFetcher は写真を取ってくるもの。
 type ImageFetcher interface {
@@ -145,7 +159,7 @@ func (c *Classifier) buildImageMessages(ctx context.Context, record suggest.Reco
 			if i >= maxExamplesPerCandidate || shown >= c.maxExampleImages {
 				break
 			}
-			image, err := c.images.FetchThumb(ctx, example.RepName, example.FileName, c.thumbSize)
+			image, err := c.fetchExampleThumb(ctx, example.RepName, example.FileName)
 			if err != nil {
 				// 見本が1枚取れなくても判定は続けられる。
 				continue
@@ -160,7 +174,7 @@ func (c *Classifier) buildImageMessages(ctx context.Context, record suggest.Reco
 
 	target, err := c.images.FetchThumb(ctx, record.RepName, record.FileName, c.thumbSize)
 	if err != nil {
-		return nil, fmt.Errorf("判定する写真を取得できません: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrImageUnavailable, err)
 	}
 
 	parts = append(parts,
@@ -173,6 +187,16 @@ func (c *Classifier) buildImageMessages(ctx context.Context, record suggest.Reco
 		{Role: llm.RoleSystem, Parts: []llm.Part{llm.TextPart(systemPrompt())}},
 		{Role: llm.RoleUser, Parts: parts},
 	}, nil
+}
+
+// fetchExampleThumb は見本の写真を短い期限つきで取る。
+//
+// 取れなければ諦める。見本が欠けても判定はできるので、
+// ここで長く待つ理由が無い。
+func (c *Classifier) fetchExampleThumb(ctx context.Context, repName string, fileName string) (gkillclient.Image, error) {
+	exampleCtx, cancel := context.WithTimeout(ctx, exampleThumbTimeout)
+	defer cancel()
+	return c.images.FetchThumb(exampleCtx, repName, fileName, c.thumbSize)
 }
 
 func (c *Classifier) buildTextMessages(record suggest.Record, candidates []suggest.Candidate) []llm.Message {
@@ -217,12 +241,12 @@ func candidateInstruction(candidates []suggest.Candidate) string {
 func parseJudgements(answer string, candidates []suggest.Candidate) ([]suggest.Judgement, error) {
 	extracted, ok := llm.ExtractJSONObject(answer)
 	if !ok {
-		return nil, fmt.Errorf("LLM の応答から JSON を取り出せません")
+		return nil, fmt.Errorf("%w: 応答から JSON を取り出せません", llm.ErrBadResponse)
 	}
 
 	payload := judgementsPayload{}
 	if err := json.Unmarshal([]byte(extracted), &payload); err != nil {
-		return nil, fmt.Errorf("error at parse judgements: %w", err)
+		return nil, fmt.Errorf("%w: %w", llm.ErrBadResponse, err)
 	}
 
 	allowed := make(map[string]struct{}, len(candidates))

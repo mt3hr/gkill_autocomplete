@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -23,6 +24,22 @@ import (
 
 // maxErrorBodyBytes はエラー時に読むレスポンス本文の上限。
 const maxErrorBodyBytes = 512
+
+// 失敗の種類。呼び出し側が errors.Is で見分けて、
+// **記録の中身を含まない決め打ちの理由**に置き換えるために使う。
+//
+// エラー本文をそのまま画面やログへ出すことはできない。
+// LLM の応答には判定させた記録の中身が混ざりうるため。
+var (
+	// ErrUnreachable は LLM に接続できないこと。
+	ErrUnreachable = errors.New("LLM に繋がりません")
+	// ErrTimeout は応答が時間内に返らなかったこと。
+	ErrTimeout = errors.New("LLM が時間切れになりました")
+	// ErrRejected は LLM がエラー応答を返したこと。
+	ErrRejected = errors.New("LLM がエラーを返しました")
+	// ErrBadResponse は応答を解釈できなかったこと。
+	ErrBadResponse = errors.New("LLM の応答を解釈できません")
+)
 
 // Role は発言者。
 const (
@@ -135,7 +152,11 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message)
 
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("LLM に繋がりません。起動しているか確認してください: %w", err)
+		var netError net.Error
+		if errors.As(err, &netError) && netError.Timeout() {
+			return "", fmt.Errorf("%w (%s で打ち切りました): %w", ErrTimeout, c.httpClient.Timeout, err)
+		}
+		return "", fmt.Errorf("%w。起動しているか確認してください: %w", ErrUnreachable, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 
@@ -147,26 +168,26 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message)
 		// 既定の 4096 を超える。素のエラー文だけでは原因が分からない。
 		if strings.Contains(string(peeked), "context size") || strings.Contains(string(peeked), "n_ctx") {
 			return "", fmt.Errorf(
-				"LLM の文脈長が足りません。写真は1枚で千数百トークンになるため、"+
+				"%w: 文脈長が足りません。写真は1枚で千数百トークンになるため、"+
 					"見本を添えると既定の 4096 では収まりません。\n"+
 					"  次のどちらかで直せます:\n"+
 					"    1. LLM 側の文脈長を広げる (Ollama なら環境変数 OLLAMA_CONTEXT_LENGTH=16384 を設定して再起動)\n"+
 					"    2. 設定の candidates.max_few_shot_images を減らす (0 にすると見本を添えません)\n"+
-					"  元の応答: %q", string(peeked))
+					"  元の応答: %q", ErrRejected, string(peeked))
 		}
 
-		return "", fmt.Errorf("LLM が HTTP %d を返しました: %q", response.StatusCode, string(peeked))
+		return "", fmt.Errorf("%w: HTTP %d: %q", ErrRejected, response.StatusCode, string(peeked))
 	}
 
 	decoded := chatResponse{}
 	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
-		return "", fmt.Errorf("error at parse chat response: %w", err)
+		return "", fmt.Errorf("%w: %w", ErrBadResponse, err)
 	}
 	if decoded.Error != nil {
-		return "", fmt.Errorf("LLM がエラーを返しました: %s", decoded.Error.Message)
+		return "", fmt.Errorf("%w: %s", ErrRejected, decoded.Error.Message)
 	}
 	if len(decoded.Choices) == 0 {
-		return "", errors.New("LLM の応答が空です")
+		return "", fmt.Errorf("%w: 応答が空です", ErrBadResponse)
 	}
 	return decoded.Choices[0].Message.Content, nil
 }

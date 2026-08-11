@@ -17,6 +17,9 @@ export type SuggestionRecord = {
     related_time: string
     is_image: boolean
     thumb_url: string
+    // file_name はファイルの記録(idf)の名前。
+    // 画像でない idf は写真も本文も持たないので、これが唯一の手がかりになる。
+    file_name: string
     text: string
     existing_tags: string[] | null
     suggestions: Suggestion[]
@@ -33,13 +36,34 @@ export type DecideResponse = {
     pending: number
 }
 
-export type AnalyzeResponse = {
+export type AnalyzeReport = {
     LearnedRecords: number
     CandidateRecords: number
     SuggestedRecords: number
     NoSuggestionRecords: number
     StoredSuggestions: number
     SkippedByVerdict: number
+    // FailedRecords は判定に失敗して飛ばした記録の数。
+    // 0 でなくても解析そのものは完走している。次の解析でやり直される。
+    FailedRecords: number
+    // FailureReason は最も多かった失敗の理由。決め打ちの文言だけが入る
+    // (エラー本文には記録の中身が混ざりうるので載せない)。
+    FailureReason: string
+}
+
+// AnalyzeStatus は解析の進み具合。
+//
+// **解析はリクエストより長生きする。** 写真の判定は1件で数分かかるので、
+// 1本の HTTP 要求の中で終わらせようとすると、タブを閉じただけで止まる。
+// 開始と進捗の確認を分けてあるのはそのため。
+export type AnalyzeStatus = {
+    running: boolean
+    done: number
+    total: number
+    // report は直近の解析の結果。走っている間や、一度も走っていなければ null。
+    report: AnalyzeReport | null
+    // failure は直近の解析が落ちた理由。
+    failure?: string
     pending: number
 }
 
@@ -145,6 +169,24 @@ export function decide(target_id: string, approve_tags: string[]): Promise<Decid
     })
 }
 
-export function analyze(): Promise<AnalyzeResponse> {
-    return post<AnalyzeResponse>('/api/analyze', {})
+// start_analyze は解析を始めるよう頼む。**終わるのを待たない。**
+//
+// すでに走っている場合も失敗にはならない。いまの進み具合が返る。
+export function start_analyze(): Promise<AnalyzeStatus> {
+    return post<AnalyzeStatus>('/api/analyze', {})
+}
+
+// fetch_analyze_status はいまの進み具合を取る。
+export async function fetch_analyze_status(): Promise<AnalyzeStatus> {
+    const response = await fetch('/api/analyze/status')
+
+    const parsed = (await response.json()) as AnalyzeStatus & { error?: string }
+
+    if (response.status === 401) {
+        throw new UnauthorizedError(parsed.error ?? 'ログインしてください')
+    }
+    if (!response.ok || parsed.error) {
+        throw new Error(parsed.error ?? `サーバが HTTP ${response.status} を返しました`)
+    }
+    return parsed
 }

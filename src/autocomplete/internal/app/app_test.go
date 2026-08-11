@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/config"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/gkillclient"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/llm"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/store"
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/suggest"
 )
@@ -220,6 +223,147 @@ func TestAnalyzeSuggestsFromRepeatedText(t *testing.T) {
 	}
 }
 
+// failingClassifier は必ず失敗する判定器。
+//
+// LLM の時間切れ・応答の解釈失敗・写真が取れない、といったことを模す。
+type failingClassifier struct {
+	calls int
+}
+
+func (c *failingClassifier) Classify(_ context.Context, _ suggest.Record, _ []suggest.Candidate) ([]suggest.Judgement, error) {
+	c.calls++
+	return nil, errors.New("判定に失敗しました")
+}
+
+// TestAnalyzeDoesNotStopAtFirstFailure は、判定に失敗した記録があっても
+// 残りの記録が捨てられないことを確かめる。
+//
+// **これを落とすと「解析が数件で止まる」に戻る。** 1件の失敗で解析全体を
+// 諦めていたころは、後ろに並んだ記録が永久に処理されなかった。
+// しかも失敗する記録は評価済みにならないので、何度やり直しても
+// 同じ場所で止まり続けた。
+func TestAnalyzeDoesNotStopAtFirstFailure(t *testing.T) {
+	kyous := []map[string]any{
+		// 候補タグが立つだけの履歴。
+		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		// 判定対象。本文はどれも履歴と一致せず、タグ名も含まない。
+		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
+		kyouJSON("new-2", at(9, 12, 0), nil, "ふたつめ"),
+		kyouJSON("new-3", at(9, 14, 0), nil, "みっつめ"),
+	}
+
+	appConfig := config.Default()
+	// 履歴1件でも候補タグが立つようにする。
+	appConfig.Candidates.MinExamples = 1
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+	classifier := &failingClassifier{}
+	application.Classifier = classifier
+
+	report, err := application.Analyze(context.Background())
+	if err != nil {
+		t.Fatalf("1件の失敗で解析全体が落ちている: %v", err)
+	}
+
+	if report.CandidateRecords != 3 {
+		t.Fatalf("判定対象 = %d件, want 3件", report.CandidateRecords)
+	}
+	if classifier.calls != 3 {
+		t.Errorf("判定器の呼び出し = %d回, want 3回 (失敗しても次へ進むはず)", classifier.calls)
+	}
+	if report.FailedRecords != 3 {
+		t.Errorf("判定に失敗した記録 = %d件, want 3件", report.FailedRecords)
+	}
+
+	// 失敗した記録は評価済みにしない。次の解析でやり直せるようにするため。
+	evaluated, err := application.Store.EvaluatedTargetIDs(context.Background(), testUserID)
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+	if len(evaluated) != 0 {
+		t.Errorf("評価済みの記録 = %d件, want 0件 (失敗した記録は次にやり直す)", len(evaluated))
+	}
+}
+
+// TestAnalyzeReportsWhyEveryRecordFailed は、全件失敗したときに理由が残ることを確かめる。
+//
+// **件数だけでは何をすればよいか分からない。** LLM を落としたまま解析すると
+// 全件が失敗するが、飛ばして進む作りでは「N件中N件失敗」としか出ず、
+// 原因に辿り着けない。理由は決め打ちの文字列で、記録の中身を含まない。
+func TestAnalyzeReportsWhyEveryRecordFailed(t *testing.T) {
+	kyous := []map[string]any{
+		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
+		kyouJSON("new-2", at(9, 12, 0), nil, "ふたつめ"),
+	}
+
+	appConfig := config.Default()
+	appConfig.Candidates.MinExamples = 1
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+	// LLM が起動していない状況を模す。
+	application.Classifier = &unreachableClassifier{}
+
+	report, err := application.Analyze(context.Background())
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+
+	if report.FailedRecords != report.CandidateRecords || report.CandidateRecords == 0 {
+		t.Fatalf("失敗 %d件 / 対象 %d件, want 全件失敗", report.FailedRecords, report.CandidateRecords)
+	}
+	if !strings.Contains(report.FailureReason, "LLM に繋がらない") {
+		t.Errorf("理由 = %q, want 「LLM に繋がらない」を含む", report.FailureReason)
+	}
+	// 理由は決め打ちの文字列だけ。記録の中身を混ぜない。
+	for _, secret := range []string{"ひとつめ", "ふたつめ", "むかしの本文"} {
+		if strings.Contains(report.FailureReason, secret) {
+			t.Errorf("理由に記録の中身が入っている: %q", report.FailureReason)
+		}
+	}
+}
+
+// unreachableClassifier は LLM に繋がらない状況を模す判定器。
+type unreachableClassifier struct{}
+
+func (unreachableClassifier) Classify(_ context.Context, _ suggest.Record, _ []suggest.Candidate) ([]suggest.Judgement, error) {
+	return nil, fmt.Errorf("%w: dial tcp 127.0.0.1:11434: connection refused", llm.ErrUnreachable)
+}
+
+// TestAnalyzeStopsWhenCancelled は、中断は中断として扱うことを確かめる。
+//
+// 判定の失敗は飛ばして進むが、利用者が止めたときまで進み続けてはいけない。
+func TestAnalyzeStopsWhenCancelled(t *testing.T) {
+	kyous := []map[string]any{
+		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
+		kyouJSON("new-2", at(9, 12, 0), nil, "ふたつめ"),
+	}
+
+	appConfig := config.Default()
+	appConfig.Candidates.MinExamples = 1
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 1件目の判定に入ったところで中断する。
+	application.Classifier = &cancellingClassifier{cancel: cancel}
+
+	if _, err := application.Analyze(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("エラー = %v, want context.Canceled", err)
+	}
+}
+
+// cancellingClassifier は呼ばれた時点で解析を中断させる判定器。
+type cancellingClassifier struct {
+	cancel context.CancelFunc
+}
+
+func (c *cancellingClassifier) Classify(_ context.Context, _ suggest.Record, _ []suggest.Candidate) ([]suggest.Judgement, error) {
+	c.cancel()
+	return nil, errors.New("中断されました")
+}
+
 func TestAnalyzeSkipsAlreadyTaggedRecords(t *testing.T) {
 	kyous := []map[string]any{
 		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "定型の本文"),
@@ -258,7 +402,7 @@ func TestAnalyzeDoesNotResurrectRejectedSuggestions(t *testing.T) {
 		t.Fatalf("提案 = %d件, want 1件", len(pending))
 	}
 
-	if err := application.Store.Decide(ctx, testUserID,pending[0].ID, store.DecisionRejected, at(10, 13, 0)); err != nil {
+	if err := application.Store.Decide(ctx, testUserID, pending[0].ID, store.DecisionRejected, at(10, 13, 0)); err != nil {
 		t.Fatalf("想定外のエラー: %v", err)
 	}
 

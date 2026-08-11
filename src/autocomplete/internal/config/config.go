@@ -226,9 +226,12 @@ func Default() Config {
 			TimeoutSeconds:     120,
 		},
 		LLM: LLMConfig{
-			Endpoint:       "http://127.0.0.1:11434/v1/chat/completions",
-			AllowRemote:    false,
-			TimeoutSeconds: 180,
+			Endpoint:    "http://127.0.0.1:11434/v1/chat/completions",
+			AllowRemote: false,
+			// 写真の判定は1件で10分近くかかることがある(CPU で動かした場合)。
+			// 短く切ると、写真の記録だけが毎回時間切れで飛ばされ続ける。
+			// 解析はリクエストとは別に走るので、長くしても画面は待たない。
+			TimeoutSeconds: 900,
 			ThumbSize:      "400x400",
 		},
 		Scope: ScopeConfig{

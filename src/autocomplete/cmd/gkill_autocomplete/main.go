@@ -453,6 +453,11 @@ func runAnalyze(ctx context.Context) error {
 		if report.SkippedByVerdict > 0 {
 			fmt.Printf("[%s] 過去の判定により見送った提案: %d件\n", userID, report.SkippedByVerdict)
 		}
+		if report.FailedRecords > 0 {
+			// 件数だけでは何をすればよいか分からないので理由まで出す。
+			fmt.Printf("[%s] 判定に失敗した記録: %d件 (次の解析でやり直されます)\n", userID, report.FailedRecords)
+			fmt.Printf("[%s]   最も多かった理由: %s\n", userID, report.FailureReason)
+		}
 
 		pending, err := application.Store.CountPending(ctx, userID)
 		if err != nil {

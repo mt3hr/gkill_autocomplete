@@ -44,8 +44,12 @@ gkill_autocomplete --user sample_user
 gkill_autocomplete --user sample_user --user sample_user_all
 ```
 
-発行したセッションは終了時に消します。有効期間は30分で、使っている間は
+発行したセッションは終了時に消します。有効期間は1週間で、使っている間は
 自動で取り直します。**gkill の `/api/login` は一度も叩きません。**
+
+期限を長く取っているのは、確認画面を何日も上げたままにするためです。
+そのぶん gkill の `account_state.db` に長寿命の行が置かれるので、
+強制終了させたときは期限まで残ります。
 
 ### 2.2 確認画面のログイン
 

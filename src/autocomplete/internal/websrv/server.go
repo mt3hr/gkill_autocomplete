@@ -43,10 +43,17 @@ type Server struct {
 	// serveTLS は TLS で待ち受けているか。クッキーの Secure 属性に使う。
 	serveTLS bool
 
-	// mu は analyzing と imageIndex を守る。
+	// baseCtx は解析の寿命の元になる文脈。
+	//
+	// **リクエストの文脈を使ってはいけない。** 解析は数十分かかるので、
+	// タブを閉じる・再読込する・端末が眠るといったことで切れてしまう。
+	// Serve が待ち受けの文脈を入れ、終了時にまとめて止まるようにする。
+	baseCtx context.Context
+
+	// mu は analyses と imageIndex を守る。
 	mu sync.Mutex
-	// analyzing は解析の二重起動を防ぐ。利用者ごとに数える。
-	analyzing map[string]bool
+	// analyses は利用者ごとの解析の進み具合。二重起動もこれで防ぐ。
+	analyses map[string]*analysis
 	// imageIndex は利用者IDごとの「記録ID → 写真の場所」の対応。
 	//
 	// 一覧を作るたびに更新する。これがあるおかげで、画像の中継口に
@@ -80,7 +87,8 @@ func New(apps []*app.App, verifier *gkillauth.Verifier, frontend fs.FS, logger *
 		apps:       byUser,
 		frontend:   frontend,
 		logger:     logger,
-		analyzing:  map[string]bool{},
+		baseCtx:    context.Background(),
+		analyses:   map[string]*analysis{},
 		imageIndex: map[string]map[string]imageLocation{},
 		auth:       newAuthenticator(verifier, logger),
 	}
@@ -112,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/suggestions", s.requireAuth(s.handleSuggestions))
 	mux.HandleFunc("POST /api/decide", s.requireAuth(s.handleDecide))
 	mux.HandleFunc("POST /api/analyze", s.requireAuth(s.handleAnalyze))
+	mux.HandleFunc("GET /api/analyze/status", s.requireAuth(s.handleAnalyzeStatus))
 	mux.HandleFunc("GET /thumb", s.requireAuth(s.handleThumb))
 
 	if s.frontend != nil {
@@ -139,6 +148,12 @@ type ServeOptions struct {
 // 利用者に証明書をもう1枚信頼させないため。
 func (s *Server) Serve(ctx context.Context, options ServeOptions) error {
 	s.serveTLS = options.TLS.EnableTLS
+
+	// 解析はこの文脈にぶら下げる。リクエストが切れても止まらず、
+	// Ctrl+C で終了するときだけまとめて止まる。
+	s.mu.Lock()
+	s.baseCtx = ctx
+	s.mu.Unlock()
 
 	server := &http.Server{
 		Addr:              options.Listen,
@@ -223,11 +238,19 @@ type suggestionView struct {
 
 // recordView は画面に出す記録1件。
 type recordView struct {
-	TargetID    string           `json:"target_id"`
-	DataType    string           `json:"data_type"`
-	RelatedTime time.Time        `json:"related_time"`
-	IsImage     bool             `json:"is_image"`
-	ThumbURL    string           `json:"thumb_url"`
+	TargetID    string    `json:"target_id"`
+	DataType    string    `json:"data_type"`
+	RelatedTime time.Time `json:"related_time"`
+	IsImage     bool      `json:"is_image"`
+	ThumbURL    string    `json:"thumb_url"`
+
+	// FileName はファイルの記録(idf)の名前。
+	//
+	// **画像でない idf は写真も本文も持たない。** 出さないと、日時と種別しか
+	// 載っていない空の札になり、何を判定させられているのか分からない。
+	// gkill は画像以外のサムネイルを作らないので、写真の代わりに名前を出す。
+	FileName string `json:"file_name"`
+
 	Text        string           `json:"text"`
 	ExistingTag []string         `json:"existing_tags"`
 	Suggestions []suggestionView `json:"suggestions"`
@@ -284,10 +307,14 @@ func (s *Server) handleSuggestions(w http.ResponseWriter, r *http.Request, userI
 			DataType:    record.DataType,
 			RelatedTime: record.RelatedTime,
 			IsImage:     record.IsImage,
+			FileName:    record.FileName,
 			Text:        record.Text,
 			ExistingTag: record.Tags,
 			Suggestions: []suggestionView{},
 		}
+		// 写真の中継は画像のときだけ。gkill の ?thumb= は画像以外に
+		// サムネイルを作らず原本をそのまま返すので、動画や書類を
+		// 画像として引きに行かせない。
 		if record.IsImage && record.FileName != "" {
 			view.ThumbURL = "/thumb?target=" + targetID
 		}
@@ -469,14 +496,42 @@ func (s *Server) approveTag(ctx context.Context, application *app.App, suggestio
 	return application.Store.Decide(ctx, userID, suggestion.ID, store.DecisionApproved, now)
 }
 
-type analyzeResponse struct {
-	app.AnalyzeReport
+// analysis は利用者1人ぶんの解析の状態。
+//
+// **解析はリクエストより長生きする。** 写真の判定は1件で数分かかり、
+// 数十件あれば1時間を超える。画面はこれを覗きに来るだけにして、
+// タブを閉じても解析が続くようにしてある。
+type analysis struct {
+	running   bool
+	done      int
+	total     int
+	startedAt time.Time
+
+	// report は直近の解析の結果。まだ一度も終わっていなければ nil。
+	report *app.AnalyzeReport
+	// failure は直近の解析が落ちた理由。落ちていなければ空。
+	failure string
+}
+
+// analyzeStatusResponse は解析の進み具合。
+//
+// **失敗の理由を "error" というキーで返してはいけない。** 画面側の共通処理が
+// その名前を「要求そのものが失敗した」と解釈して例外にするため、
+// 解析の失敗とリクエストの失敗が混ざる。
+type analyzeStatusResponse struct {
+	Running bool `json:"running"`
+	Done    int  `json:"done"`
+	Total   int  `json:"total"`
+
+	// Report は直近の解析の結果。走っている間や、一度も走っていなければ null。
+	Report *app.AnalyzeReport `json:"report"`
+	// Failure は直近の解析が落ちた理由。
+	Failure string `json:"failure,omitempty"`
+
 	Pending int `json:"pending"`
 }
 
 func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request, userID string) {
-	ctx := r.Context()
-
 	application := s.appFor(userID)
 	if application == nil {
 		s.writeStatusError(w, http.StatusForbidden,
@@ -486,34 +541,89 @@ func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request, userID st
 	}
 
 	// 二重起動は利用者ごとに防ぐ。別の人の解析までは止めない。
+	// すでに走っている場合も失敗にはしない。画面は状態を見に来るだけでよい。
 	s.mu.Lock()
-	if s.analyzing[userID] {
-		s.mu.Unlock()
-		s.writeError(w, errors.New("解析がすでに動いています"))
-		return
+	current, ok := s.analyses[userID]
+	if !ok {
+		current = &analysis{}
+		s.analyses[userID] = current
 	}
-	s.analyzing[userID] = true
+	alreadyRunning := current.running
+	if !alreadyRunning {
+		current.running = true
+		current.done = 0
+		current.total = 0
+		current.startedAt = time.Now()
+		current.report = nil
+		current.failure = ""
+	}
+	analyzeCtx := s.baseCtx
 	s.mu.Unlock()
 
-	defer func() {
-		s.mu.Lock()
-		delete(s.analyzing, userID)
-		s.mu.Unlock()
-	}()
+	if !alreadyRunning {
+		go s.runAnalysis(analyzeCtx, application, userID)
+	}
 
-	report, err := application.Analyze(ctx)
-	if err != nil {
-		s.writeError(w, err)
+	s.writeJSON(w, s.analyzeStatus(r.Context(), application, userID))
+}
+
+// runAnalysis は解析を最後まで走らせる。リクエストとは別の寿命で動く。
+func (s *Server) runAnalysis(ctx context.Context, application *app.App, userID string) {
+	report, err := application.AnalyzeWithProgress(ctx, func(progress app.Progress) {
+		s.mu.Lock()
+		if current, ok := s.analyses[userID]; ok {
+			current.done = progress.Done
+			current.total = progress.Total
+		}
+		s.mu.Unlock()
+	})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, ok := s.analyses[userID]
+	if !ok {
 		return
 	}
+	current.running = false
+	if err != nil {
+		// エラー本文には記録の中身が混ざりうるので、ログには要約しか出さない。
+		s.logger.Warn("解析が途中で終わりました")
+		current.failure = err.Error()
+		return
+	}
+	current.report = &report
+}
+
+func (s *Server) handleAnalyzeStatus(w http.ResponseWriter, r *http.Request, userID string) {
+	application := s.appFor(userID)
+	if application == nil {
+		s.writeJSON(w, analyzeStatusResponse{})
+		return
+	}
+	s.writeJSON(w, s.analyzeStatus(r.Context(), application, userID))
+}
+
+// analyzeStatus はいまの進み具合を組み立てる。
+func (s *Server) analyzeStatus(ctx context.Context, application *app.App, userID string) analyzeStatusResponse {
+	s.mu.Lock()
+	response := analyzeStatusResponse{}
+	if current, ok := s.analyses[userID]; ok {
+		response.Running = current.running
+		response.Done = current.done
+		response.Total = current.total
+		response.Report = current.report
+		response.Failure = current.failure
+	}
+	s.mu.Unlock()
 
 	pending, err := application.Store.CountPending(ctx, userID)
 	if err != nil {
-		s.writeError(w, err)
-		return
+		s.logger.Warn("確認待ちの件数を数えられませんでした")
+		return response
 	}
-
-	s.writeJSON(w, analyzeResponse{AnalyzeReport: report, Pending: pending})
+	response.Pending = pending
+	return response
 }
 
 // handleThumb は写真を中継する。

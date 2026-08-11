@@ -1,11 +1,13 @@
 import { computed, onMounted, onUnmounted, ref, type Ref } from 'vue'
 import { useTheme } from 'vuetify'
 import {
-    analyze,
     decide,
+    fetch_analyze_status,
     fetch_suggestions,
     logout,
+    start_analyze,
     UnauthorizedError,
+    type AnalyzeStatus,
     type SuggestionRecord,
 } from './api'
 import { set_use_dark_theme } from './theme'
@@ -18,6 +20,11 @@ type AlertMessage = {
 
 // 通知の自動消滅までの時間。gkill 本体と同じ長さにしてある。
 const alert_auto_close_milli_seconds = 2500
+
+// 解析の進み具合を見に行く間隔。
+//
+// 写真1件の判定は数分かかることがあるので、細かく叩いても意味が無い。
+const analyze_poll_interval_milli_seconds = 2000
 
 // on_unauthorized は期限切れなどでログインが要るようになったときに呼ばれる。
 export function useTagSuggestionPage(on_unauthorized: () => void) {
@@ -37,9 +44,20 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
     const pending_count = ref(0)
     const messages: Ref<AlertMessage[]> = ref([])
 
+    // analyze_done / analyze_total は解析の進み具合。
+    // 総数が決まる前は 0 / 0 になる。
+    const analyze_done = ref(0)
+    const analyze_total = ref(0)
+
     let next_message_id = 0
     // in_flight は同じ記録への二重確定を防ぐ。
     const in_flight = new Set<string>()
+
+    // analyze_poll_timer_id は進み具合を見に行くタイマー。
+    // **onUnmounted で必ず解除する。** 残すと画面を離れても叩き続ける。
+    let analyze_poll_timer_id: ReturnType<typeof setTimeout> | null = null
+    // is_unmounted はタイマー解除後に飛んできた応答を捨てるための印。
+    let is_unmounted = false
 
     // ── Computed ──
     const focused_record = computed<SuggestionRecord | null>(() => records.value[focused_index.value] ?? null)
@@ -97,20 +115,101 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
         }
     }
 
+    // run_analyze は解析を始めて、終わるまで進み具合を見に行く。
+    //
+    // **解析の完了を1本の要求で待たない。** 写真の判定は1件で数分かかるので、
+    // 待つ作りにするとタブを閉じただけで解析が止まる。
+    // ここで待つのは画面の表示だけで、解析はサーバ側で走り続ける。
     async function run_analyze(): Promise<void> {
-        is_analyzing.value = true
-        try {
-            const report = await analyze()
-            push_message(
-                `解析しました: 提案あり ${report.SuggestedRecords}件 / 提案なし ${report.NoSuggestionRecords}件`,
-                false,
-            )
-            await load()
-        } catch (error) {
-            report_error(error)
-        } finally {
-            is_analyzing.value = false
+        if (is_analyzing.value) {
+            return
         }
+        is_analyzing.value = true
+        analyze_done.value = 0
+        analyze_total.value = 0
+        try {
+            apply_analyze_status(await start_analyze())
+        } catch (error) {
+            is_analyzing.value = false
+            report_error(error)
+            return
+        }
+        // 押した直後に終わっていることもある(判定対象が0件のときなど)。
+        if (is_analyzing.value) {
+            schedule_analyze_poll()
+        }
+    }
+
+    function schedule_analyze_poll(): void {
+        if (is_unmounted) {
+            return
+        }
+        analyze_poll_timer_id = setTimeout(() => {
+            void poll_analyze()
+        }, analyze_poll_interval_milli_seconds)
+    }
+
+    async function poll_analyze(): Promise<void> {
+        if (is_unmounted) {
+            return
+        }
+        try {
+            apply_analyze_status(await fetch_analyze_status())
+        } catch (error) {
+            is_analyzing.value = false
+            report_error(error)
+            return
+        }
+        if (is_analyzing.value) {
+            schedule_analyze_poll()
+        }
+    }
+
+    // apply_analyze_status は進み具合を画面へ反映し、終わっていれば知らせる。
+    function apply_analyze_status(status: AnalyzeStatus): void {
+        analyze_done.value = status.done
+        analyze_total.value = status.total
+        pending_count.value = status.pending
+
+        if (status.running) {
+            is_analyzing.value = true
+            return
+        }
+
+        // ここから下は「走っていない」ときだけ。
+        // 押した直後にまだ始まっていない場合と区別が付かないので、
+        // 走らせていたときにだけ結果を出す。
+        if (!is_analyzing.value) {
+            return
+        }
+        is_analyzing.value = false
+
+        if (status.failure) {
+            push_message(`解析が途中で終わりました: ${status.failure}`, true)
+            void load()
+            return
+        }
+        if (status.report) {
+            const report = status.report
+
+            // 全件失敗は接続先か設定の問題。件数だけ出しても動けないので理由を出す。
+            if (report.FailedRecords > 0 && report.FailedRecords === report.CandidateRecords) {
+                push_message(
+                    `判定する記録 ${report.CandidateRecords}件がすべて失敗しました: ${report.FailureReason}`,
+                    true,
+                )
+                void load()
+                return
+            }
+
+            let text = `解析しました: 提案あり ${report.SuggestedRecords}件 / 提案なし ${report.NoSuggestionRecords}件`
+            if (report.FailedRecords > 0) {
+                // 飛ばした記録があることは黙らない。次の解析でやり直される。
+                text += ` / 判定できず ${report.FailedRecords}件 (${report.FailureReason})`
+            }
+            push_message(text, report.FailedRecords > 0)
+        }
+        void load()
     }
 
     // ── Selection ──
@@ -275,14 +374,39 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
         }
     }
 
+    // resume_analyze は、画面を開いた時点で解析が走っていれば表示を引き継ぐ。
+    //
+    // 解析はリクエストとは別に走っているので、再読込しても止まっていない。
+    // 何も出さないと「押したのに何も起きていない」ように見える。
+    async function resume_analyze(): Promise<void> {
+        try {
+            const status = await fetch_analyze_status()
+            if (!status.running) {
+                return
+            }
+            is_analyzing.value = true
+            apply_analyze_status(status)
+            schedule_analyze_poll()
+        } catch {
+            // 引き継ぎに失敗しても画面は使える。黙って諦める。
+        }
+    }
+
     // ── Lifecycle ──
     onMounted(() => {
         window.addEventListener('keydown', on_keydown)
         void load()
+        void resume_analyze()
     })
 
     onUnmounted(() => {
         window.removeEventListener('keydown', on_keydown)
+        // タイマーを解除しないと、画面を離れたあとも叩き続ける。
+        is_unmounted = true
+        if (analyze_poll_timer_id !== null) {
+            clearTimeout(analyze_poll_timer_id)
+            analyze_poll_timer_id = null
+        }
     })
 
     // ── Return ──
@@ -298,6 +422,8 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
         is_dark_theme,
         has_records,
         pending_count,
+        analyze_done,
+        analyze_total,
         messages,
         load,
         run_analyze,

@@ -241,7 +241,8 @@ finish()              閾値で足切りし、確信度の高い順に並べる
 | --- | --- |
 | `POST /api/suggestions` | 未判定の提案を記録ごとにまとめて返す |
 | `POST /api/decide` | 承認と却下を受け付ける |
-| `POST /api/analyze` | 解析を実行する |
+| `POST /api/analyze` | 解析を始める（終わるのを待たない） |
+| `GET /api/analyze/status` | 解析の進み具合と直近の結果を返す |
 | `GET /thumb?target=<記録のID>` | 写真を中継する |
 
 ### 9.2 記録の中身は取り直す
