@@ -1,0 +1,162 @@
+{
+  "_comment": [
+    "gkill_autocomplete の設定の雛形。値はすべて架空です。",
+    "",
+    "実際の設定はこのファイルではなく $GKILL_AUTOCOMPLETE_HOME/config.json に置きます",
+    "(既定 $HOME/gkill_autocomplete/config.json)。リポジトリの中には置かないでください。",
+    "個人の記録に結びつくタグ名・リポジトリ名が入るためです。",
+    "",
+    "`gkill_autocomplete init` を実行すると、稼働中の gkill を解析して",
+    "あなたの使い方に合わせた config.json を生成します。既存ファイルは上書きしません。",
+    "`gkill_autocomplete --print-config` で既定値をそのまま出力できます。",
+    "",
+    "キー名が `_` で始まる項目はすべて読み飛ばされます。メモを書き込んで構いません。"
+  ],
+
+  "server": {
+    "_comment": [
+      "確認画面を配信する Web サーバ。",
+      "",
+      "ループバック以外にも開けます。画面は gkill のアカウントでログインしないと",
+      "入れず、通信は gkill 本体と同じ証明書で暗号化されます。",
+      "",
+      "別の端末から開く場合、その証明書がどの名前を保証しているかを確かめてください。",
+      "載っていない名前で開くとブラウザが止めます(自己署名かどうかとは別の話で、",
+      "証明書を端末に入れても解決しません)。詳しくは operations-guide.md の3章。"
+    ],
+    "listen": "127.0.0.1:9797"
+  },
+
+  "gkill": {
+    "_comment": [
+      "稼働中の gkill との繋ぎ方。",
+      "",
+      "資格情報は書きません。認証は $GKILL_HOME/configs/ を直接見て行うので、",
+      "パスワードもそのハッシュも要りません。コマンドラインには利用者IDだけを渡します:",
+      "  gkill_autocomplete --user <利用者ID>",
+      "",
+      "home は gkill のホームディレクトリ。空なら $GKILL_HOME、",
+      "それも空なら $HOME/gkill を使います。",
+      "",
+      "base_url は gkill 本体の宛先。空なら server_config.db から組み立てます。",
+      "TLS の有無も待ち受けポートもそちらに書いてあるので、通常は空のままで構いません。",
+      "手で書くと、gkill 側の設定を変えたときに食い違って繋がらなくなります。"
+    ],
+    "home": "",
+    "base_url": "",
+    "locale_name": "ja",
+    "_comment_insecure_skip_verify": [
+      "gkill が localhost 向けに使う証明書は自己署名なので、検証を通せません。",
+      "gkill 本体も同梱の MCP サーバも同じように検証を省いています。"
+    ],
+    "insecure_skip_verify": true,
+    "timeout_seconds": 120
+  },
+
+  "llm": {
+    "_comment": [
+      "判定に使うローカル LLM。OpenAI 互換の /v1/chat/completions を叩きます。",
+      "Ollama / llama.cpp / LM Studio のいずれでも動きます。",
+      "",
+      "endpoint がループバック(127.0.0.1 / ::1 / localhost)以外の場合、",
+      "allow_remote を true にしない限り起動を拒否します。生活ログの本文と写真を",
+      "外部へ送らないための安全装置です。allow_remote を有効にする意味を",
+      "理解していない場合は触らないでください。",
+      "",
+      "vision_model は写真の判定に使います。視覚モデルが必要です",
+      "(例: ollama pull で取得)。text_model は本文の判定に使います。"
+    ],
+    "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+    "allow_remote": false,
+    "text_model": "example-text-model:8b",
+    "vision_model": "example-vision-model:7b",
+    "timeout_seconds": 180,
+    "_comment_thumb_size": "gkill に要求するサムネの大きさ。各辺 1〜1024。範囲外を書くと原本(全画素)が返ります。",
+    "thumb_size": "400x400"
+  },
+
+  "scope": {
+    "_comment": [
+      "解析の対象範囲。無制限に走らせると自動収集された記録まで拾ってしまうので",
+      "必ず絞ります。",
+      "",
+      "rep_prefixes が空のときは「手作業でタグを付けている割合が高いリポジトリ」を",
+      "自動で選びます。特定のリポジトリだけを見たいときに名前を書いてください。",
+      "data_types が空のときはすべての種別が対象です。"
+    ],
+    "rep_prefixes": [],
+    "data_types": [],
+    "candidate_days": 30,
+    "learn_days": 180,
+    "_comment_max_scan_records": [
+      "1回の解析で読む記録数の上限。範囲を絞らずに走らせたときの歯止め。",
+      "ここに達すると学習が不完全なまま終わるので、達したら警告が出る。",
+      "警告が出たら、範囲を絞るか learn_days を縮めるか、この値を上げること。"
+    ],
+    "max_scan_records": 60000
+  },
+
+  "exclude": {
+    "_comment": [
+      "提案の対象から外すもの。",
+      "tag_patterns は前方一致のワイルドカード(`*` のみ)。他のツールが機械的に",
+      "付けたタグを候補から外すために使います。",
+      "already_tagged が true のとき、タグが1つでも付いている記録は対象外です。"
+    ],
+    "tag_patterns": ["example_auto_*"],
+    "already_tagged": true
+  },
+
+  "candidates": {
+    "_comment": [
+      "候補タグの絞り込み。履歴での実績が min_examples 件に満たないタグは",
+      "候補になりません。max_candidate_tags は LLM に一度に問う上限です。"
+    ],
+    "min_examples": 5,
+    "max_candidate_tags": 8,
+    "max_few_shot_examples": 4,
+    "_comment_max_few_shot_images": [
+      "LLM に見せる見本写真の総数。",
+      "写真は1枚で千数百トークンになるので、積みすぎると文脈長を超えて判定が失敗する。",
+      "文脈長が既定(4096)のままの環境では2枚が上限に近い。0 にすると見本を送らない。",
+      "Ollama なら OLLAMA_CONTEXT_LENGTH で広げられる。"
+    ],
+    "max_few_shot_images": 2
+  },
+
+  "scoring": {
+    "_comment": [
+      "確信度の合成と足切り。threshold 未満は提案しません。",
+      "候補タグごとに独立して判定するので、結果は 0 個にも複数個にもなります。",
+      "0 個は異常ではなく、「タグを付けない」という正常な答えです。"
+    ],
+    "threshold": 0.6,
+    "exact_text_match_confidence": 0.95,
+    "neighbor_window_minutes": 5,
+    "time_of_day_weight": 0.1
+  },
+
+  "rules": [
+    {
+      "_comment": "文脈を限定して候補タグを固定する。学習に任せず自分で決めたいとき。",
+      "when": { "rep_prefix": "SampleRep" },
+      "candidate_tags": ["タグA", "タグB"]
+    },
+    {
+      "_comment": "本文が完全一致したら決め打ちする。LLM を呼ばないので速く確実。",
+      "when": { "text_equals": "定型の本文" },
+      "suggest": ["タグA"],
+      "confidence": 0.99
+    },
+    {
+      "_comment": "近くの時刻にある別の記録のタイトルから引き写す。",
+      "when": { "neighbor_title_contains": "語" },
+      "suggest": ["タグB"]
+    },
+    {
+      "_comment": "このタグは絶対に提案しない。",
+      "when": { "tag": "タグC" },
+      "never_suggest": true
+    }
+  ]
+}

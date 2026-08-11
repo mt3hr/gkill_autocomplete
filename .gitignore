@@ -1,0 +1,85 @@
+# ---------------------------------------------------------------- 機密・個人情報
+# 実運用の設定。実在のタグ名・リポジトリ名が入る。
+# 雛形の config.example.json だけを追跡する。
+/config.json
+config.local.json
+config.json.*
+# 過去の版が残していたセッションファイル。いまは作らないが、混入させない。
+session.json
+# 環境変数ファイル。
+.env
+.env.*
+!.env.example
+# TLS の証明書と鍵。gkill 本体のものを使うのでリポジトリには要らないが、
+# 検証で持ち込んだものを取り込まないようにしておく。
+*.pem
+*.key
+*.cer
+*.crt
+*.pfx
+*.p12
+
+# ---------------------------------------------------------------- 実行時に作られるもの
+# 提案と人間の判定を入れる SQLite。中身は生活ログのIDとタグ名そのもの。
+# 通常は $GKILL_AUTOCOMPLETE_HOME(リポジトリ外)に作られるが、
+# そこをリポジトリ内に向けても混入しないようにしておく。
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+# 退避した DB(gkill_autocomplete.db.before_xxx のような名前)。
+*.db.*
+*.sqlite
+*.sqlite3
+*.log
+logs/
+work/
+# gkill から取り寄せた画像。原則ディスクに残さないが、念のため。
+#
+# **PWA のアイコンだけは追跡する。** src/tools/build_icons.mjs が
+# public/ へ生成するもので、記録の中身は一切含まない。
+# これを外すとインストールできない PWA になる。
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.mp4
+!/public/*.png
+# 精度計測の出力。実タグ名・実rep名が入る。
+benchmark_out/
+*.report.json
+
+# ---------------------------------------------------------------- ビルド成果物
+*.exe
+*.exe~
+*.test
+*.dll
+*.so
+*.dylib
+/release/
+/dist/
+# vue-tsc の複合ビルドが vite.config.ts の隣に吐く成果物。
+/vite.config.js
+/vite.config.d.ts
+/*.tsbuildinfo
+# 確認画面のビルド成果物。PLACEHOLDER.md だけは追跡する
+# (ディレクトリが空になると go:embed がコンパイルエラーになるため)。
+/src/autocomplete/internal/embed/html/*
+!/src/autocomplete/internal/embed/html/PLACEHOLDER.md
+
+# Go のローカルワークスペース。環境ごとに違うので共有しない。
+go.work
+go.work.sum
+
+# ビルドに使う Node のパッケージ。package-lock.json は追跡する。
+node_modules/
+
+# ---------------------------------------------------------------- エディタ・OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+*.swp
+*~
+# Cygwin の bash が落ちたときに残すメモリダンプ。
+*.stackdump

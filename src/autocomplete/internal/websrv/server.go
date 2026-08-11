@@ -1,0 +1,578 @@
+// Package websrv は確認画面を配信し、承認と却下を受け付ける。
+//
+// 画面には未確認の提案、つまり利用者の記録の中身がそのまま並ぶ。
+// そのため次の2つを守る。
+//
+//	認証 … gkill のアカウントで守る(照合は internal/gkillauth)。
+//	暗号 … gkill 本体と同じ証明書で TLS を張る。
+//
+// **見せてよいのはログインした本人の記録だけ。** 記録に触れる口はすべて
+// requireAuth を通し、保存先への問い合わせは必ず利用者IDで絞る。
+package websrv
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/app"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/config"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/gkillauth"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/gkillclient"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/store"
+	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/suggest"
+)
+
+// Server は確認画面のサーバ。
+type Server struct {
+	// apps は利用者IDごとの解析本体。起動時に --user へ渡した人ぶんだけある。
+	//
+	// ログインできるのは gkill の全アカウントだが、提案を持つのはここにいる人だけ。
+	apps     map[string]*app.App
+	frontend fs.FS
+	logger   *slog.Logger
+	auth     *authenticator
+
+	// serveTLS は TLS で待ち受けているか。クッキーの Secure 属性に使う。
+	serveTLS bool
+
+	// mu は analyzing と imageIndex を守る。
+	mu sync.Mutex
+	// analyzing は解析の二重起動を防ぐ。利用者ごとに数える。
+	analyzing map[string]bool
+	// imageIndex は利用者IDごとの「記録ID → 写真の場所」の対応。
+	//
+	// 一覧を作るたびに更新する。これがあるおかげで、画像の中継口に
+	// リポジトリ名やファイル名を外から渡させずに済む。
+	//
+	// **利用者ごとに分けているのは、他人の一覧に載った写真を
+	// 記録IDだけで引けてしまわないようにするため。**
+	imageIndex map[string]map[string]imageLocation
+}
+
+type imageLocation struct {
+	RepName  string
+	FileName string
+}
+
+// New はサーバを作る。
+//
+// apps は解析対象の利用者ぶん。verifier はログインの照合に使う。
+// frontend は埋め込んだ画面のファイル群。
+func New(apps []*app.App, verifier *gkillauth.Verifier, frontend fs.FS, logger *slog.Logger) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	byUser := make(map[string]*app.App, len(apps))
+	for _, application := range apps {
+		byUser[application.UserID()] = application
+	}
+
+	return &Server{
+		apps:       byUser,
+		frontend:   frontend,
+		logger:     logger,
+		analyzing:  map[string]bool{},
+		imageIndex: map[string]map[string]imageLocation{},
+		auth:       newAuthenticator(verifier, logger),
+	}
+}
+
+// appFor はその利用者の解析本体を返す。用意されていなければ nil。
+func (s *Server) appFor(userID string) *app.App {
+	return s.apps[userID]
+}
+
+// storeOf は保存先を返す。どの App も同じ保存先を共有している。
+func (s *Server) storeOf() *store.Store {
+	for _, application := range s.apps {
+		return application.Store
+	}
+	return nil
+}
+
+// Handler はルーティング済みのハンドラを返す。
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	// ログインまわりだけは認証を要らない。
+	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("POST /api/logout", s.handleLogout)
+	mux.HandleFunc("GET /api/session", s.handleSession)
+
+	// 記録の中身に触れる口はすべて認証の後ろに置く。
+	mux.HandleFunc("POST /api/suggestions", s.requireAuth(s.handleSuggestions))
+	mux.HandleFunc("POST /api/decide", s.requireAuth(s.handleDecide))
+	mux.HandleFunc("POST /api/analyze", s.requireAuth(s.handleAnalyze))
+	mux.HandleFunc("GET /thumb", s.requireAuth(s.handleThumb))
+
+	if s.frontend != nil {
+		mux.Handle("/", http.FileServerFS(s.frontend))
+	}
+
+	return mux
+}
+
+// ServeOptions は待ち受けの設定。
+type ServeOptions struct {
+	// Listen は bind するアドレス。
+	Listen string
+
+	// TLS は gkill 本体から読み取った証明書の設定。
+	//
+	// EnableTLS が偽なら平文で開く。gkill が TLS を切っている構成で
+	// こちらだけ TLS にすると、利用者から見て食い違うため。
+	TLS gkillauth.ServerSettings
+}
+
+// Serve は待ち受けを始める。
+//
+// 証明書は gkill 本体が使っているものをそのまま使う。専用のものを作らないのは、
+// 利用者に証明書をもう1枚信頼させないため。
+func (s *Server) Serve(ctx context.Context, options ServeOptions) error {
+	s.serveTLS = options.TLS.EnableTLS
+
+	server := &http.Server{
+		Addr:              options.Listen,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	scheme := "http"
+	if s.serveTLS {
+		scheme = "https"
+	}
+	s.logger.Info("確認画面を開きました",
+		slog.String("url", scheme+"://"+options.Listen+"/"))
+	s.warnIfExposed(options.Listen)
+
+	var err error
+	if s.serveTLS {
+		if certErr := options.TLS.EnsureTLSFilesExist(); certErr != nil {
+			return certErr
+		}
+		err = server.ListenAndServeTLS(options.TLS.CertFile, options.TLS.KeyFile)
+	} else {
+		err = server.ListenAndServe()
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("error at serve: %w", err)
+	}
+	return nil
+}
+
+// warnIfExposed はループバック以外に開いていることを毎回知らせる。
+//
+// 設定を一度書けば以後は黙って開き続けるので、開いていること自体を
+// 忘れないよう起動のたびに出す。
+func (s *Server) warnIfExposed(listen string) {
+	loopback, err := config.IsLoopbackListenAddr(listen)
+	if err != nil || loopback {
+		return
+	}
+
+	if !s.serveTLS {
+		s.logger.Warn(
+			"確認画面をループバック以外に、暗号化せずに開いています。"+
+				"同じ網にいる相手には、やり取りする資格情報や記録の中身が見えます。"+
+				"gkill 側で TLS を有効にしてください",
+			slog.String("bind", listen))
+		return
+	}
+
+	// gkill が作る証明書は localhost 向けなので、別端末からは
+	// 「証明書の名前が一致しない」と言われる。開くたびに理由を出しておく。
+	s.logger.Warn(
+		"確認画面をループバック以外に開いています。gkill と同じ証明書を使っていますが、"+
+			"その証明書は localhost 向けに作られているため、"+
+			"別の端末のブラウザでは名前が一致しないという警告が出ます",
+		slog.String("bind", listen))
+}
+
+// writeStatusError は状態コードつきで失敗を伝える。
+func (s *Server) writeStatusError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// suggestionView は画面に出す提案1件。
+type suggestionView struct {
+	ID         string  `json:"id"`
+	Tag        string  `json:"tag"`
+	Confidence float64 `json:"confidence"`
+	Tier       string  `json:"tier"`
+	Reason     string  `json:"reason"`
+}
+
+// recordView は画面に出す記録1件。
+type recordView struct {
+	TargetID    string           `json:"target_id"`
+	DataType    string           `json:"data_type"`
+	RelatedTime time.Time        `json:"related_time"`
+	IsImage     bool             `json:"is_image"`
+	ThumbURL    string           `json:"thumb_url"`
+	Text        string           `json:"text"`
+	ExistingTag []string         `json:"existing_tags"`
+	Suggestions []suggestionView `json:"suggestions"`
+}
+
+type suggestionsResponse struct {
+	Records []recordView `json:"records"`
+	Pending int          `json:"pending"`
+}
+
+func (s *Server) handleSuggestions(w http.ResponseWriter, r *http.Request, userID string) {
+	ctx := r.Context()
+
+	application := s.appFor(userID)
+	if application == nil {
+		// ログインはできるが解析対象ではない利用者。
+		// 他人の提案を見せるわけにはいかないので、空を返す。
+		s.writeJSON(w, suggestionsResponse{Records: []recordView{}, Pending: 0})
+		return
+	}
+
+	pending, err := application.Store.ListPending(ctx, userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	// 記録ごとにまとめる。画面は1件ずつ順に捌くため。
+	order := []string{}
+	byTarget := map[string][]store.Suggestion{}
+	for _, suggestion := range pending {
+		if _, ok := byTarget[suggestion.TargetID]; !ok {
+			order = append(order, suggestion.TargetID)
+		}
+		byTarget[suggestion.TargetID] = append(byTarget[suggestion.TargetID], suggestion)
+	}
+
+	records, err := s.fetchRecords(ctx, application, order)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	response := suggestionsResponse{Records: []recordView{}, Pending: len(pending)}
+	for _, targetID := range order {
+		record, ok := records[targetID]
+		if !ok {
+			// gkill 側から消えた記録。画面には出さない。
+			continue
+		}
+
+		view := recordView{
+			TargetID:    targetID,
+			DataType:    record.DataType,
+			RelatedTime: record.RelatedTime,
+			IsImage:     record.IsImage,
+			Text:        record.Text,
+			ExistingTag: record.Tags,
+			Suggestions: []suggestionView{},
+		}
+		if record.IsImage && record.FileName != "" {
+			view.ThumbURL = "/thumb?target=" + targetID
+		}
+		for _, suggestion := range byTarget[targetID] {
+			view.Suggestions = append(view.Suggestions, suggestionView{
+				ID:         suggestion.ID,
+				Tag:        suggestion.Tag,
+				Confidence: suggestion.Confidence,
+				Tier:       suggestion.Tier,
+				Reason:     suggestion.Reason,
+			})
+		}
+		response.Records = append(response.Records, view)
+	}
+
+	s.writeJSON(w, response)
+}
+
+// fetchRecords は記録の中身を gkill から取り直す。
+//
+// 提案の保存先には記録の中身を置いていない。画面に出すものは
+// そのつど取り直すことで、gkill 側で消したり直したりした結果が
+// そのまま反映される。
+func (s *Server) fetchRecords(ctx context.Context, application *app.App, targetIDs []string) (map[string]suggest.Record, error) {
+	if len(targetIDs) == 0 {
+		return map[string]suggest.Record{}, nil
+	}
+
+	kyous, err := application.Client.FetchKyous(ctx, &gkillclient.FindQuery{
+		IDs:            targetIDs,
+		OnlyLatestData: true,
+	}, gkillclient.FetchOptions{IncludeID: true})
+	if err != nil {
+		return nil, err
+	}
+
+	records := make(map[string]suggest.Record, len(kyous))
+	index := make(map[string]imageLocation, len(kyous))
+	for _, kyou := range kyous {
+		record := suggest.FromKyou(kyou)
+		records[record.ID] = record
+		if record.IsImage && record.FileName != "" {
+			index[record.ID] = imageLocation{RepName: record.RepName, FileName: record.FileName}
+		}
+	}
+
+	// 索引はこの利用者のぶんだけ差し替える。他の利用者の索引は残す。
+	s.mu.Lock()
+	s.imageIndex[application.UserID()] = index
+	s.mu.Unlock()
+
+	return records, nil
+}
+
+type decideRequest struct {
+	TargetID string `json:"target_id"`
+	// ApproveTags は承認するタグ。gkill へ書き込む。
+	ApproveTags []string `json:"approve_tags"`
+	// NoTagNeeded はこの記録にタグは要らないという判定。
+	NoTagNeeded bool `json:"no_tag_needed"`
+}
+
+type decideResponse struct {
+	Approved int `json:"approved"`
+	Rejected int `json:"rejected"`
+	Pending  int `json:"pending"`
+}
+
+// handleDecide は承認と却下を受け付ける。
+//
+// 承認したタグだけを gkill へ書き込み、同じ記録の残りの提案は却下として畳む。
+// 何も承認せずに確定した場合は「タグは要らない」として記録する。
+func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request, userID string) {
+	ctx := r.Context()
+
+	application := s.appFor(userID)
+	if application == nil {
+		s.writeStatusError(w, http.StatusForbidden,
+			"このアカウントは解析の対象に含まれていません")
+		return
+	}
+
+	request := decideRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		s.writeError(w, fmt.Errorf("リクエストを解釈できません: %w", err))
+		return
+	}
+	if request.TargetID == "" {
+		s.writeError(w, errors.New("target_id がありません"))
+		return
+	}
+
+	// 自分の未判定の提案しか取れない。他人の提案IDを送りつけられても
+	// この一覧に無いので、下のループで一致せず何も起きない。
+	pending, err := application.Store.ListPending(ctx, userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	approve := map[string]bool{}
+	for _, tagName := range request.ApproveTags {
+		approve[tagName] = true
+	}
+
+	response := decideResponse{}
+	now := time.Now()
+
+	for _, suggestion := range pending {
+		if suggestion.TargetID != request.TargetID {
+			continue
+		}
+
+		if !approve[suggestion.Tag] {
+			// 承認しなかったものは却下として畳む。
+			// そうしないと同じ記録が何度も出てくる。
+			if err := application.Store.Decide(ctx, userID, suggestion.ID, store.DecisionRejected, now); err != nil {
+				s.writeError(w, err)
+				return
+			}
+			response.Rejected++
+			continue
+		}
+
+		if err := s.approveTag(ctx, application, suggestion, now); err != nil {
+			s.writeError(w, err)
+			return
+		}
+		response.Approved++
+	}
+
+	if request.NoTagNeeded && response.Approved == 0 {
+		if err := application.Store.MarkNoTagNeeded(ctx, userID, request.TargetID, now); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	}
+
+	remaining, err := application.Store.CountPending(ctx, userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	response.Pending = remaining
+
+	s.writeJSON(w, response)
+}
+
+// approveTag はタグを gkill へ書き込み、承認として記録する。
+func (s *Server) approveTag(ctx context.Context, application *app.App, suggestion store.Suggestion, now time.Time) error {
+	deviceName, err := os.Hostname()
+	if err != nil {
+		deviceName = "unknown"
+	}
+
+	userID := application.UserID()
+
+	tag := gkillclient.NewTag(
+		suggestion.TagID,
+		suggestion.TargetID,
+		suggestion.Tag,
+		// 記録そのものの時刻に合わせる。省くと時系列の表示から外れてしまう。
+		suggestion.RelatedTime,
+		userID,
+		deviceName,
+		now,
+	)
+
+	alreadyExist, err := application.Client.AddTag(ctx, tag)
+	if err != nil {
+		return err
+	}
+	if alreadyExist {
+		// 過去に付けて手で消したか、二度承認したか。どちらも
+		// 「何もしない」が正しい。蘇らせない。
+		s.logger.Info("同じIDのタグが既にあるため書き込みませんでした")
+	}
+
+	return application.Store.Decide(ctx, userID, suggestion.ID, store.DecisionApproved, now)
+}
+
+type analyzeResponse struct {
+	app.AnalyzeReport
+	Pending int `json:"pending"`
+}
+
+func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request, userID string) {
+	ctx := r.Context()
+
+	application := s.appFor(userID)
+	if application == nil {
+		s.writeStatusError(w, http.StatusForbidden,
+			"このアカウントは解析の対象に含まれていません。"+
+				"起動時に --user で指定してください")
+		return
+	}
+
+	// 二重起動は利用者ごとに防ぐ。別の人の解析までは止めない。
+	s.mu.Lock()
+	if s.analyzing[userID] {
+		s.mu.Unlock()
+		s.writeError(w, errors.New("解析がすでに動いています"))
+		return
+	}
+	s.analyzing[userID] = true
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.analyzing, userID)
+		s.mu.Unlock()
+	}()
+
+	report, err := application.Analyze(ctx)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	pending, err := application.Store.CountPending(ctx, userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	s.writeJSON(w, analyzeResponse{AnalyzeReport: report, Pending: pending})
+}
+
+// handleThumb は写真を中継する。
+//
+// 受け取るのは記録のIDだけ。リポジトリ名やファイル名を外から渡させないので、
+// 一覧に出ていない場所のファイルを読ませることはできない。
+// 取得したものはディスクに残さない。
+//
+// 索引は利用者ごとなので、**他人の一覧に載っている写真は記録IDを知っていても引けない**。
+func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request, userID string) {
+	targetID := r.URL.Query().Get("target")
+	if targetID == "" {
+		http.Error(w, "target がありません", http.StatusBadRequest)
+		return
+	}
+
+	application := s.appFor(userID)
+	if application == nil {
+		http.Error(w, "その記録の写真は一覧にありません", http.StatusNotFound)
+		return
+	}
+
+	s.mu.Lock()
+	location, ok := s.imageIndex[userID][targetID]
+	s.mu.Unlock()
+
+	if !ok {
+		http.Error(w, "その記録の写真は一覧にありません", http.StatusNotFound)
+		return
+	}
+
+	image, err := application.Client.FetchThumb(r.Context(), location.RepName, location.FileName, application.Config.LLM.ThumbSize)
+	if err != nil {
+		s.logger.Warn("写真を取得できませんでした", slog.String("error", err.Error()))
+		http.Error(w, "写真を取得できませんでした", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", image.ContentType)
+	// 記録の中身なので、ブラウザ以外に残さない。
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(image.Bytes)
+}
+
+func (s *Server) writeJSON(w http.ResponseWriter, body any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		s.logger.Warn("応答を書けませんでした", slog.String("error", err.Error()))
+	}
+}
+
+// writeError は失敗を伝える。
+//
+// エラー本文には記録の中身が混ざりうるので、画面には出すが
+// ログには要約しか出さない。
+func (s *Server) writeError(w http.ResponseWriter, err error) {
+	s.logger.Warn("要求を処理できませんでした")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusInternalServerError)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
