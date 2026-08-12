@@ -22,6 +22,12 @@ const (
 	TierLLM = "llm"
 	// TierNone はどの段階でも決まらなかった(提案0個)。
 	TierNone = "none"
+	// TierHopeless は LLM を呼んでも結果が必ず足切りされるため呼ばなかった。
+	//
+	// **提案0個という意味では TierNone と同じ。** 別の名前にしてあるのは、
+	// 「候補が無かった」のか「呼んでも無駄だった」のかを後から数えられるようにするため。
+	// 判定の速さはこの割合でほぼ決まるので、見えないと調整のしようがない。
+	TierHopeless = "hopeless"
 )
 
 // 各段階の基準となる確信度。
@@ -123,6 +129,25 @@ func (e *Engine) Suggest(ctx context.Context, record Record, neighbors []Record)
 		return Result{Suggestions: nil, Tier: TierNone}, nil
 	}
 
+	// **結果が必ず捨てられるなら LLM を呼ばない。**
+	//
+	// LLM の確信度は最大 1.0 で、そのあと dampenByHabit が
+	// keepRate = 1 - UntaggedRate(文脈) を掛け、finish が閾値未満を落とす。
+	// つまり割り引き後の上限は keepRate そのものなので、
+	// keepRate が閾値に届かない文脈では、満点の答えが返っても必ず落ちる。
+	//
+	// **提案の中身は1件も変わらない。** 捨てられると分かっている答えを
+	// 作る手間だけが消える。
+	//
+	// これが効くのは、ほとんどタグを付けていない場所の記録が大半を占めるため。
+	// ある実環境では判定の61.7%が LLM に流れ、そのうち約9割が提案0個で
+	// 終わっていた。1件あたり5.3秒かかるので、16万件の判定が10日規模になっていた。
+	// この関門を入れたあとは LLM に流れるのが1.0%になり、判定は
+	// 11件/分から1,284件/分になった。
+	if !e.canSurviveHabitDamping(record) {
+		return Result{Suggestions: nil, Tier: TierHopeless}, nil
+	}
+
 	judgements, err := e.classifier.Classify(ctx, record, candidates)
 	if err != nil {
 		return Result{}, fmt.Errorf("error at classify record: %w", err)
@@ -141,6 +166,20 @@ func (e *Engine) Suggest(ctx context.Context, record Record, neighbors []Record)
 		})
 	}
 	return Result{Suggestions: e.finish(e.dampenByHabit(record, fromLLM)), Tier: TierLLM}, nil
+}
+
+// canSurviveHabitDamping は、割り引きを受けても閾値を超えられる余地があるかを返す。
+//
+// dampenByHabit と finish の対を先読みしているだけで、判定そのものはしない。
+// **ここを変えるときは dampenByHabit と finish の両方を見ること。**
+// 割り引き方や足切りの仕方が変わると、この先読みが嘘になる。
+func (e *Engine) canSurviveHabitDamping(record Record) bool {
+	keepRate := 1 - e.knowledge.UntaggedRate(record.ContextKey())
+	if keepRate >= 1 {
+		// 割り引きが無い文脈。dampenByHabit も素通りする。
+		return true
+	}
+	return keepRate >= e.scoring.Threshold
 }
 
 // dampenByHabit は「その場でそもそもタグを付けるか」で確信度を割り引く。

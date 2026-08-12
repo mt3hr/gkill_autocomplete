@@ -107,8 +107,21 @@ type ScopeConfig struct {
 	// DataTypes が空のときは全種別が対象。
 	DataTypes []string `json:"data_types"`
 
+	// CandidateDays は提案の対象にする記録の範囲(日数)。
+	//
+	// **LLM を呼ぶのはこの範囲の記録だけ。** 伸ばすほど判定の件数が増える。
 	CandidateDays int `json:"candidate_days"`
-	LearnDays     int `json:"learn_days"`
+
+	// LearnDays はタグの付け方を学ぶ記録の範囲(日数)。
+	//
+	// **LLM は1回も呼ばれない。** 費用は取得の時間とメモリだけ。
+	//
+	// CandidateDays より短くしてよい。その場合「昔の記録まで候補に出すが、
+	// 判断は最近の習慣に沿う」という動きになる。逆に長くしてもよく、
+	// そのときは候補にしない古い記録もタグの傾向を学ぶ材料になる。
+	//
+	// gkill から取ってくる範囲は両者の**広いほう**で、取得は1回で済む。
+	LearnDays int `json:"learn_days"`
 
 	// MaxScanRecords は1回の解析で読む記録数の上限。
 	//

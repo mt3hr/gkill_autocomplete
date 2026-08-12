@@ -245,7 +245,17 @@ func (c *failingClassifier) Classify(_ context.Context, _ suggest.Record, _ []su
 func TestAnalyzeDoesNotStopAtFirstFailure(t *testing.T) {
 	kyous := []map[string]any{
 		// 候補タグが立つだけの履歴。
+		//
+		// **タグ付きを多めに置くのは、判定が LLM の段階まで到達するようにするため。**
+		// ほとんどタグを付けていない文脈では、LLM が満点を返しても割り引きで
+		// 閾値を割るので、engine が呼び出し自体を省く(TierHopeless)。
+		// ここで検査したいのは「LLM が失敗しても次へ進むこと」なので、
+		// 未タグ率を閾値より下げて LLM に届く形にしておく。
 		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		kyouJSON("past-2", at(5, 8, 1), []string{"タグA"}, "むかしの本文2"),
+		kyouJSON("past-3", at(5, 8, 2), []string{"タグA"}, "むかしの本文3"),
+		kyouJSON("past-4", at(5, 8, 3), []string{"タグA"}, "むかしの本文4"),
+		kyouJSON("past-5", at(5, 8, 4), []string{"タグA"}, "むかしの本文5"),
 		// 判定対象。本文はどれも履歴と一致せず、タグ名も含まない。
 		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
 		kyouJSON("new-2", at(9, 12, 0), nil, "ふたつめ"),
@@ -292,7 +302,11 @@ func TestAnalyzeDoesNotStopAtFirstFailure(t *testing.T) {
 // 原因に辿り着けない。理由は決め打ちの文字列で、記録の中身を含まない。
 func TestAnalyzeReportsWhyEveryRecordFailed(t *testing.T) {
 	kyous := []map[string]any{
+		// タグ付きを多めに置く理由は TestAnalyzeDoesNotStopAtFirstFailure と同じ。
+		// 未タグ率が高いと LLM の段階へ行く前に打ち切られてしまう。
 		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		kyouJSON("past-2", at(5, 8, 1), []string{"タグA"}, "むかしの本文2"),
+		kyouJSON("past-3", at(5, 8, 2), []string{"タグA"}, "むかしの本文3"),
 		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
 		kyouJSON("new-2", at(9, 12, 0), nil, "ふたつめ"),
 	}
@@ -335,7 +349,11 @@ func (unreachableClassifier) Classify(_ context.Context, _ suggest.Record, _ []s
 // 判定の失敗は飛ばして進むが、利用者が止めたときまで進み続けてはいけない。
 func TestAnalyzeStopsWhenCancelled(t *testing.T) {
 	kyous := []map[string]any{
+		// タグ付きを多めに置く理由は TestAnalyzeDoesNotStopAtFirstFailure と同じ。
+		// 未タグ率が高いと LLM の段階へ行く前に打ち切られてしまう。
 		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		kyouJSON("past-2", at(5, 8, 1), []string{"タグA"}, "むかしの本文2"),
+		kyouJSON("past-3", at(5, 8, 2), []string{"タグA"}, "むかしの本文3"),
 		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
 		kyouJSON("new-2", at(9, 12, 0), nil, "ふたつめ"),
 	}
@@ -478,6 +496,44 @@ func TestAnalyzeIgnoresRecordsOlderThanCandidateWindow(t *testing.T) {
 	// 学習には古い記録も使う。
 	if report.LearnedRecords != 3 {
 		t.Errorf("学習した記録 = %d件, want 3件", report.LearnedRecords)
+	}
+}
+
+func TestAnalyzeLearnsOnlyFromTheLearnWindow(t *testing.T) {
+	// 「昔の記録まで候補に出すが、判断は最近の習慣に沿ってほしい」。
+	//
+	// 取得は学習と候補の広いほう(=ここでは候補側)で行い、
+	// 学習にはそのうち学習の窓に入るものだけを使う。
+	// 取得した数と学習した数が食い違うので、報告も別々に持つ。
+	appConfig := config.Default()
+	appConfig.Scope.CandidateDays = 180
+	appConfig.Scope.LearnDays = 3
+
+	kyous := []map[string]any{
+		// 判定の基準時刻は 6/10 12:00。学習の窓は3日なので 6/7 より前は学習に使わない。
+		kyouJSON("old-tagged", at(1, 8, 0), []string{"タグA"}, "定型の本文"),
+		kyouJSON("old-untagged", at(2, 8, 0), nil, "定型の本文"),
+		kyouJSON("recent-tagged", at(9, 8, 0), []string{"タグB"}, "別の本文"),
+	}
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+
+	report, err := application.Analyze(context.Background())
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+
+	// 候補の窓のほうが広いので、取得は3件すべて。
+	if report.FetchedRecords != 3 {
+		t.Errorf("取得した記録 = %d件, want 3件", report.FetchedRecords)
+	}
+	// 学習に使うのは 6/7 以降の1件だけ。
+	if report.LearnedRecords != 1 {
+		t.Errorf("学習した記録 = %d件, want 1件 (学習の窓の外が混ざっている)", report.LearnedRecords)
+	}
+	// 未タグで候補範囲に入るのは old-untagged の1件。
+	if report.CandidateRecords != 1 {
+		t.Errorf("判定対象 = %d件, want 1件", report.CandidateRecords)
 	}
 }
 

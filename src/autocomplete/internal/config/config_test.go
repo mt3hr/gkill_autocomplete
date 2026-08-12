@@ -274,13 +274,17 @@ func TestParseRejectsRuleWithoutCondition(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsLearnDaysShorterThanCandidateDays(t *testing.T) {
+func TestValidateAllowsLearnDaysShorterThanCandidateDays(t *testing.T) {
+	// 「昔の記録まで候補に出すが、判断は最近の習慣に沿ってほしい」という指定。
+	// かつては拒否していた(取得範囲が learn_days で決まっていて、candidate_days を
+	// 広く書いても黙って learn_days ぶんしか候補にならなかったため)。
+	// いまは取得範囲が両者の広いほうになったので成り立つ。
 	target := Default()
-	target.Scope.CandidateDays = 90
-	target.Scope.LearnDays = 30
+	target.Scope.CandidateDays = 10958
+	target.Scope.LearnDays = 365
 
-	if err := Validate(target); err == nil {
-		t.Fatal("学習範囲が候補範囲より狭い設定が通ってしまった")
+	if err := Validate(target); err != nil {
+		t.Fatalf("学習範囲が候補範囲より狭い設定が拒否された: %v", err)
 	}
 }
 

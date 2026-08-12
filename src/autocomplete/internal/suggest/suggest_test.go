@@ -475,6 +475,42 @@ func TestClassifierDecidesWhenEarlierTiersCannot(t *testing.T) {
 	}
 }
 
+func TestClassifierIsSkippedWhenDampingMakesItHopeless(t *testing.T) {
+	// ほとんどタグを付けていない場所では、LLM が満点を返しても
+	// dampenByHabit の割り引きで閾値を割るため、提案は必ず0個になる。
+	// **その呼び出しを最初からしない。** 1件5秒前後かかるので、
+	// 割合が大きいと判定が桁違いに遅くなる(実測で16万件が10日コースになった)。
+	//
+	// タグ付き5件・タグ無し20件 -> 未タグ率 0.8 -> keepRate 0.2 < 閾値 0.6。
+	records := []Record{}
+	for i := range 5 {
+		records = append(records, imageRecord("tagged", "SampleRep_DeviceA_20200101", at(8, i, 0), "タグA"))
+	}
+	for i := range 20 {
+		records = append(records, imageRecord("untagged", "SampleRep_DeviceA_20200101", at(9, i, 0)))
+	}
+	knowledge := Learn(records, LearnOptions{})
+
+	classifier := &stubClassifier{judgements: []Judgement{
+		{Tag: "タグA", Yes: true, Confidence: 1.0, Reason: "満点でも通らない"},
+	}}
+	engine := NewEngine(knowledge, config.Default(), classifier)
+
+	result, err := engine.Suggest(context.Background(), imageRecord("new", "SampleRep_DeviceA_20200101", at(13, 0, 0)), nil)
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+	if classifier.calls != 0 {
+		t.Errorf("LLM を %d 回呼んでいる。満点でも足切りされる文脈なので呼ぶ意味がない", classifier.calls)
+	}
+	if result.Tier != TierHopeless {
+		t.Errorf("tier = %q, want %q", result.Tier, TierHopeless)
+	}
+	if len(result.Suggestions) != 0 {
+		t.Errorf("提案 = %+v, want 0件", result.Suggestions)
+	}
+}
+
 func TestClassifierNoIsRespected(t *testing.T) {
 	// 候補に挙げても LLM が否定したら提案しない。
 	records := []Record{}

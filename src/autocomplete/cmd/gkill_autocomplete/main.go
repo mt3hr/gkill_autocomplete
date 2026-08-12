@@ -445,7 +445,13 @@ func runAnalyze(ctx context.Context) error {
 			return fmt.Errorf("[%s] %w", userID, err)
 		}
 
-		fmt.Printf("[%s] 学習した記録: %d件\n", userID, report.LearnedRecords)
+		fmt.Printf("[%s] 取得した記録: %d件\n", userID, report.FetchedRecords)
+		if report.LearnedRecords != report.FetchedRecords {
+			// 学習の窓が候補の窓より狭いとき。取得した数との違いを見せる。
+			fmt.Printf("[%s] 学習した記録: %d件 (学習の窓に入るぶんだけ)\n", userID, report.LearnedRecords)
+		} else {
+			fmt.Printf("[%s] 学習した記録: %d件\n", userID, report.LearnedRecords)
+		}
 		fmt.Printf("[%s] 判定した記録: %d件\n", userID, report.CandidateRecords)
 		fmt.Printf("[%s]   提案あり: %d件\n", userID, report.SuggestedRecords)
 		fmt.Printf("[%s]   提案なし: %d件 (タグを付けないことも正常な結果です)\n", userID, report.NoSuggestionRecords)

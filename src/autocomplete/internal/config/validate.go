@@ -109,11 +109,15 @@ func validateScope(c ScopeConfig) []error {
 	if c.LearnDays <= 0 {
 		problems = append(problems, fmt.Errorf("scope.learn_days は1以上にしてください (現在 %d)", c.LearnDays))
 	}
-	if c.LearnDays < c.CandidateDays {
-		problems = append(problems, fmt.Errorf(
-			"scope.learn_days (%d) が scope.candidate_days (%d) より短いです。"+
-				"提案したい範囲より学習範囲が狭いと、候補タグが出揃いません", c.LearnDays, c.CandidateDays))
-	}
+	// **learn_days < candidate_days は許す。**
+	//
+	// かつては拒否していた。取得範囲が learn_days で決まっていた頃は、
+	// candidate_days を広く書いても実際には learn_days ぶんしか候補にならず、
+	// それが黙って起きるより起動を止めるほうがましだったため。
+	//
+	// いまは取得範囲が両者の広いほうになり、学習の窓は名前どおり
+	// 「学習に使う範囲」を指す。「昔の分まで候補に出したいが、判断は
+	// 最近の習慣に沿ってほしい」を素直に書けるようになったので、拒否しない。
 	if c.MaxScanRecords <= 0 {
 		problems = append(problems, fmt.Errorf("scope.max_scan_records は1以上にしてください (現在 %d)", c.MaxScanRecords))
 	}

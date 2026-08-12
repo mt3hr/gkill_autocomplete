@@ -35,6 +35,44 @@ func TestLooksLikeVisionModel(t *testing.T) {
 	}
 }
 
+func TestCompleteConstrainsTheAnswer(t *testing.T) {
+	// 実運用で踏んだもの。上限も形の指定も渡していなかったため、
+	// モデルが同じ判定を繰り返し続けて文脈長を使い切り、
+	// 閉じ括弧の無い JSON を返して ErrBadResponse になった
+	// (2026-08-12: 1件に8分08秒かけて約4,460トークン)。
+	//
+	// 指示文でお願いするだけでは足りないので、送る側で縛れていることを固定する。
+	received := chatRequest{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("リクエストを読めない: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}]}`))
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "text-model", "", 10*time.Second)
+	if _, err := client.Complete(context.Background(), "text-model", []Message{
+		{Role: RoleUser, Parts: []Part{TextPart("本文")}},
+	}); err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+
+	if received.MaxTokens != maxAnswerTokens {
+		t.Errorf("max_tokens = %d, want %d (無制限だと終わらない応答が起きる)", received.MaxTokens, maxAnswerTokens)
+	}
+	if received.ResponseFormat == nil {
+		t.Fatal("response_format が付いていない (JSON を文法で縛れていない)")
+	}
+	if received.ResponseFormat.Type != responseFormatJSONObject {
+		t.Errorf("response_format.type = %q, want %q", received.ResponseFormat.Type, responseFormatJSONObject)
+	}
+	// 判定の揺れを抑えるための 0 が消えていないこと。
+	if received.Temperature != 0 {
+		t.Errorf("temperature = %v, want 0", received.Temperature)
+	}
+}
+
 func TestCompleteExplainsContextSizeError(t *testing.T) {
 	// 実運用で踏んだもの。写真の見本を数枚添えるだけで既定の 4096 を超え、
 	// 素のエラー文だけでは何を直せばよいか分からなかった。

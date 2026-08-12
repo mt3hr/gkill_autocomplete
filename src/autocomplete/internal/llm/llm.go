@@ -25,6 +25,18 @@ import (
 // maxErrorBodyBytes はエラー時に読むレスポンス本文の上限。
 const maxErrorBodyBytes = 512
 
+// maxAnswerTokens は1回の応答に許す長さ。
+//
+// **これが無いと応答が終わらないことがある。** 判定は temperature 0 の
+// 貪欲デコードなので、モデルが同じ判定を繰り返し続ける状態に入りうる。
+// 上限を渡さないと llama.cpp 側は n_predict を実質無制限として扱い、
+// 文脈長を使い切るまで生成し続けたうえで、閉じ括弧の無い JSON を返す
+// (2026-08-12 の実測: 1件に8分08秒かけて約4,460トークンを生成し、
+// ExtractJSONObject が対応する "}" を見つけられず ErrBadResponse になった)。
+//
+// 正しい応答は候補6個でも200トークン前後で終わるので、512 で足りる。
+const maxAnswerTokens = 512
+
 // 失敗の種類。呼び出し側が errors.Is で見分けて、
 // **記録の中身を含まない決め打ちの理由**に置き換えるために使う。
 //
@@ -109,12 +121,33 @@ type Message struct {
 	Parts []Part `json:"content"`
 }
 
+// responseFormat は応答の形の指定。
+//
+// OpenAI 互換の口はこれを受け取ると、JSON として成り立つ出力しか
+// 生成できないよう文法で縛る。Ollama・llama.cpp・LM Studio のいずれも解する。
+type responseFormat struct {
+	Type string `json:"type"`
+}
+
+// responseFormatJSONObject は「JSON オブジェクトだけを返せ」の指定。
+const responseFormatJSONObject = "json_object"
+
 type chatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	// Temperature は判定の揺れを抑えるため0にする。
 	Temperature float64 `json:"temperature"`
 	Stream      bool    `json:"stream"`
+
+	// MaxTokens は応答の長さの上限。maxAnswerTokens を参照。
+	MaxTokens int `json:"max_tokens,omitempty"`
+
+	// ResponseFormat は JSON だけを返させるための指定。
+	//
+	// **お願いするだけでは足りない。** 指示文でも JSON だけを求めているが、
+	// 従わずに前置きを書いたり、途中で切れた JSON を返したりすることがある。
+	// ここで指定すると文法で縛られるので、壊れた JSON が原理的に作れなくなる。
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 }
 
 type chatResponse struct {
@@ -135,10 +168,12 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message)
 	}
 
 	marshaled, err := json.Marshal(chatRequest{
-		Model:       model,
-		Messages:    messages,
-		Temperature: 0,
-		Stream:      false,
+		Model:          model,
+		Messages:       messages,
+		Temperature:    0,
+		Stream:         false,
+		MaxTokens:      maxAnswerTokens,
+		ResponseFormat: &responseFormat{Type: responseFormatJSONObject},
 	})
 	if err != nil {
 		return "", fmt.Errorf("error at marshal chat request: %w", err)
@@ -171,7 +206,10 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message)
 				"%w: 文脈長が足りません。写真は1枚で千数百トークンになるため、"+
 					"見本を添えると既定の 4096 では収まりません。\n"+
 					"  次のどちらかで直せます:\n"+
-					"    1. LLM 側の文脈長を広げる (Ollama なら環境変数 OLLAMA_CONTEXT_LENGTH=16384 を設定して再起動)\n"+
+					"    1. LLM 側の文脈長を広げる\n"+
+					"       - Ollama       : 環境変数 OLLAMA_CONTEXT_LENGTH=16384 を設定して再起動\n"+
+					"                        (モデル側に PARAMETER num_ctx を書く手もあります)\n"+
+					"       - llama-server : 起動時の --ctx-size を大きくする\n"+
 					"    2. 設定の candidates.max_few_shot_images を減らす (0 にすると見本を添えません)\n"+
 					"  元の応答: %q", ErrRejected, string(peeked))
 		}

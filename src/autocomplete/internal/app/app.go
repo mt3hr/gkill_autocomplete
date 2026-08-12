@@ -33,12 +33,15 @@ func (a *App) warnIfScanTruncated(fetched int) {
 		return
 	}
 	a.logger().Warn(
-		"取得が上限に達したため、学習に使う記録が欠けています。"+
-			"提案の質が落ちます。scope.rep_prefixes で範囲を絞るか、"+
-			"scope.learn_days を縮めるか、scope.max_scan_records を上げてください",
+		"取得が上限に達したため、記録が欠けています。"+
+			"学習も候補選びも不完全になり、提案の質が落ちます。"+
+			"scope.rep_prefixes で範囲を絞るか、scope.learn_days か scope.candidate_days を"+
+			"縮めるか、scope.max_scan_records を上げてください",
 		slog.Int("取得した記録", fetched),
 		slog.Int("上限", limit),
-		slog.Int("学習範囲の日数", a.Config.Scope.LearnDays))
+		slog.Int("取得範囲の日数", a.fetchDays()),
+		slog.Int("学習範囲の日数", a.Config.Scope.LearnDays),
+		slog.Int("候補範囲の日数", a.Config.Scope.CandidateDays))
 }
 
 // ModelLister は LLM で使えるモデルの名前を返せるもの。
@@ -90,6 +93,12 @@ func (a *App) UserID() string {
 //
 // 中身は件数だけ。記録の内容は入れない。
 type AnalyzeReport struct {
+	// FetchedRecords は gkill から取ってきた記録の数。
+	//
+	// **LearnedRecords と別に持つ。** 学習の窓が候補の窓より狭いとき、
+	// 取ってきた数と学習に使った数は一致しない。
+	// 取得が上限で切られたことに気づくためにも、取得した数そのものが要る。
+	FetchedRecords   int
 	LearnedRecords   int
 	CandidateRecords int
 	// SuggestedRecords は1件以上の提案が出た記録の数。
@@ -143,9 +152,12 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 	if err != nil {
 		return report, err
 	}
-	report.LearnedRecords = len(records)
+	report.FetchedRecords = len(records)
 
-	knowledge := suggest.Learn(records, suggest.LearnOptions{
+	learnRecords := a.selectLearnRecords(records)
+	report.LearnedRecords = len(learnRecords)
+
+	knowledge := suggest.Learn(learnRecords, suggest.LearnOptions{
 		ExcludeTagPatterns: a.Config.Exclude.TagPatterns,
 		MaxExamples:        a.Config.Candidates.MaxFewShotExamples,
 	})
@@ -157,6 +169,7 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 	report.CandidateRecords = len(candidates)
 
 	a.logger().Info("解析を開始します",
+		slog.Int("取得した記録", report.FetchedRecords),
 		slog.Int("学習した記録", report.LearnedRecords),
 		slog.Int("判定する記録", report.CandidateRecords))
 
@@ -333,15 +346,49 @@ func (a *App) notifyProgress(onProgress func(Progress), done int, total int) {
 	onProgress(Progress{Done: done, Total: total})
 }
 
-// fetchRecords は学習範囲の記録を取る。
+// fetchDays は gkill から取ってくる範囲を日数で返す。
 //
-// 学習範囲は候補範囲を必ず含む(設定の検証で保証している)ので、
-// 取得は1回で済む。
+// 学習の窓と候補の窓のうち**広いほう**。片方だけを見て取ると、
+// もう片方が必要とする記録が手元に来ない。
+//
+// 候補のほうが広い場合(「昔の分まで候補に出したいが、判断は最近の習慣に
+// 沿ってほしい」)は、取得した記録のうち学習の窓に入るものだけを
+// selectLearnRecords が selects する。
+func (a *App) fetchDays() int {
+	return max(a.Config.Scope.LearnDays, a.Config.Scope.CandidateDays)
+}
+
+// selectLearnRecords は学習に使う記録を選ぶ。
+//
+// 候補の窓のほうが広いとき、取得した記録には学習の窓より古いものが混ざる。
+// **それを学習に混ぜない。** 昔のタグの付け方に引きずられるのを避けるためで、
+// これが「学習は直近1年・候補は全期間」を成り立たせている。
+func (a *App) selectLearnRecords(records []suggest.Record) []suggest.Record {
+	if a.Config.Scope.LearnDays >= a.fetchDays() {
+		// 取得範囲がそのまま学習範囲。絞る必要がない。
+		return records
+	}
+
+	learnStart := a.now().AddDate(0, 0, -a.Config.Scope.LearnDays)
+
+	learnRecords := make([]suggest.Record, 0, len(records))
+	for _, record := range records {
+		if record.RelatedTime.Before(learnStart) {
+			continue
+		}
+		learnRecords = append(learnRecords, record)
+	}
+	return learnRecords
+}
+
+// fetchRecords は学習と候補選びの両方に要る記録をまとめて取る。
+//
+// **取得は1回だけ。** 学習の窓と候補の窓のうち広いほうを取れば両方を賄える。
 func (a *App) fetchRecords(ctx context.Context) ([]suggest.Record, error) {
 	query := &gkillclient.FindQuery{OnlyLatestData: true}
 
-	learnStart := a.now().AddDate(0, 0, -a.Config.Scope.LearnDays)
-	query.CalendarStartDate = &learnStart
+	fetchStart := a.now().AddDate(0, 0, -a.fetchDays())
+	query.CalendarStartDate = &fetchStart
 
 	repNames, err := a.resolveRepNames(ctx)
 	if err != nil {

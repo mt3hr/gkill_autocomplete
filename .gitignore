@@ -6,6 +6,14 @@ config.local.json
 config.json.*
 # 過去の版が残していたセッションファイル。いまは作らないが、混入させない。
 session.json
+# 他のツールが「起動時のカレントディレクトリ」に秘密を置いていくことがある。
+# 2026-08-12 に Open WebUI をこのディレクトリから起動してしまい .webui_secret_key が
+# 転がっていた(未追跡だったので履歴には入っていない)。
+# 名前を決め打ちにせず、秘密鍵らしいものはまとめて弾く。
+.webui_secret_key
+*secret*
+*_token
+.netrc
 # 環境変数ファイル。
 .env
 .env.*
