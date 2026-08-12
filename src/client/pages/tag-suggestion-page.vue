@@ -17,6 +17,9 @@ const {
     focused_index,
     focused_record,
     manual_tag,
+    manual_tags,
+    can_focus_prev,
+    can_focus_next,
     is_loading,
     is_analyzing,
     is_deciding,
@@ -31,6 +34,8 @@ const {
     toggle_tag,
     is_selected,
     add_manual_tag,
+    focus_prev,
+    focus_next,
     confirm,
     reject,
     toggle_theme,
@@ -117,8 +122,18 @@ function format_confidence(value: number): string {
             </div>
 
             <template v-else-if="focused_record">
-                <div class="progress_line text-medium-emphasis">
-                    {{ focused_index + 1 }} / {{ records.length }}
+                <!-- スマートフォンではキーボードが使えないので、j / k と同じ移動をボタンでも出す。
+                     確定・タグ不要とは離しておく。並べると移動のつもりで判定を押してしまう。 -->
+                <div class="nav_row">
+                    <v-btn variant="tonal" size="small" :disabled="!can_focus_prev" @click="focus_prev()">
+                        <v-icon start>mdi-chevron-left</v-icon>前 (k)
+                    </v-btn>
+                    <div class="progress_line text-medium-emphasis">
+                        {{ focused_index + 1 }} / {{ records.length }}
+                    </div>
+                    <v-btn variant="tonal" size="small" :disabled="!can_focus_next" @click="focus_next()">
+                        次 (j)<v-icon end>mdi-chevron-right</v-icon>
+                    </v-btn>
                 </div>
 
                 <v-card class="record_card">
@@ -170,6 +185,16 @@ function format_confidence(value: number): string {
                             </v-chip>
                         </div>
 
+                        <!-- 手で足したタグ。上の候補チップは suggestions しか描かないので、
+                             ここが無いと足したタグが画面のどこにも現れない。 -->
+                        <div v-if="manual_tags.length > 0" class="candidate_list">
+                            <v-chip v-for="tag in manual_tags" :key="'manual-' + tag" color="primary" variant="flat"
+                                closable class="mr-2 mb-2" @click:close="toggle_tag(tag)">
+                                <v-icon start size="small">mdi-tag-plus-outline</v-icon>
+                                {{ tag }}
+                            </v-chip>
+                        </div>
+
                         <div class="reason_list">
                             <div v-for="suggestion in focused_record.suggestions" :key="suggestion.id"
                                 class="text-caption text-medium-emphasis">
@@ -217,9 +242,17 @@ function format_confidence(value: number): string {
     padding: 64px 16px;
 }
 
-.progress_line {
-    text-align: right;
+.nav_row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     margin-bottom: 4px;
+}
+
+.progress_line {
+    text-align: center;
+    flex: 1 1 auto;
 }
 
 .record_card {

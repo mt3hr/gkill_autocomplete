@@ -66,6 +66,22 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
 
     const has_records = computed(() => records.value.length > 0)
 
+    // manual_tags は「手で足したタグ」。
+    //
+    // **これを出さないと、足したタグが画面のどこにも現れない。**
+    // 候補のチップは focused_record.suggestions を描いているだけなので、
+    // 候補に無いタグを選んでも表示される場所が無い。確定すれば実際には付くのだが、
+    // 画面上は入力欄が空になるだけで、何も起きていないように見えてしまう。
+    const manual_tags = computed<string[]>(() => {
+        const suggested = new Set((focused_record.value?.suggestions ?? []).map((suggestion) => suggestion.tag))
+        return [...selected_tags.value].filter((tag) => !suggested.has(tag))
+    })
+
+    // 次へ・前へを押せるか。スマートフォンではキーボードが使えないので、
+    // j / k と同じ移動をボタンでも行えるようにしてある。
+    const can_focus_prev = computed(() => focused_index.value > 0)
+    const can_focus_next = computed(() => focused_index.value < records.value.length - 1)
+
     // ── Errors ──
     // report_error は失敗を画面に出す。
     // ログインが切れていた場合だけは、通知ではなくログイン画面へ戻す。
@@ -416,6 +432,9 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
         focused_record,
         selected_tags,
         manual_tag,
+        manual_tags,
+        can_focus_prev,
+        can_focus_next,
         is_loading,
         is_analyzing,
         is_deciding,
