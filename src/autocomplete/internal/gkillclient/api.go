@@ -21,6 +21,10 @@ type FetchOptions struct {
 	// IncludeID は記録のIDを含めるか。
 	// タグを付けるには対象のIDが要るので、通常は真にする。
 	IncludeID bool
+
+	// WindowDays は1回のリクエストで検索させる期間の幅（日）。0 なら既定値。
+	// 件数ではなく期間で切る理由は defaultWindowDays を参照。
+	WindowDays int
 }
 
 const (
@@ -39,6 +43,22 @@ const (
 	// 1000件が1回に収まる大きさにしておく。小さすぎると件数の上限より先に
 	// こちらで頭打ちになり、往復が増える。
 	defaultMaxSizeMB = 16.0
+
+	// defaultWindowDays は1回のリクエストで検索させる期間の幅。
+	//
+	// ★件数ではなく期間で切ることが要点。
+	//
+	//   gkill のページングは「全期間を検索して並べ替えてから先頭N件だけ返す」形なので、
+	//   カーソルでページを進めてもサーバ側の仕事はまったく減らない。
+	//   30年ぶんを1000件刻みで取ると、56万件の検索を568回くり返すことになる。
+	//   2026-08-16 の実測では、1回の検索でサーバのメモリが +1.2〜1.8GB 増え、
+	//   CPUの約4割がGCに消えて、**1ページ目すら1時間53分で終わらなかった**。
+	//
+	//   期間で切れば、1回の検索が触る件数がそのぶん減る。
+	//   90日幅なら30年で約120回だが、1回あたりは 1/120 の重さで済む。
+	//
+	//   狭くしすぎると往復のオーバーヘッドが勝つので、数十日〜数ヶ月が妥当。
+	defaultWindowDays = 90
 )
 
 // FetchKyous は条件に合う記録をすべて取る。
@@ -47,7 +67,84 @@ const (
 // /api/get_kyous が返す構造体は15項目だけで本文もタイトルもタグも含まず、
 // ページング機構も無いため、記録1件ごとに追加のリクエストが必要になる。
 // get_kyous_mcp なら tags / texts / payload が1回で揃う。
+// 取得は期間ウィンドウで分割する。理由は defaultWindowDays を参照。
 func (c *Client) FetchKyous(ctx context.Context, query *FindQuery, options FetchOptions) ([]Kyou, error) {
+	windows := splitIntoWindows(query.CalendarStartDate, query.CalendarEndDate, options.WindowDays, time.Now())
+	if len(windows) <= 1 {
+		return c.fetchKyousInWindow(ctx, query, options, 0)
+	}
+
+	// 同じ記録が窓の境目で二度返ることがあるので、IDで畳む。
+	// 境目を重ねずに切ると取りこぼすほうが怖いので、重複を許して落とす側にしてある。
+	collected := make([]Kyou, 0, defaultPageLimit)
+	seen := map[string]struct{}{}
+	for _, fetchWindow := range windows {
+		if options.MaxTotal > 0 && len(collected) >= options.MaxTotal {
+			break
+		}
+		windowQuery := *query
+		windowQuery.CalendarStartDate = &fetchWindow.start
+		windowQuery.CalendarEndDate = &fetchWindow.end
+
+		kyous, err := c.fetchKyousInWindow(ctx, &windowQuery, options, len(collected))
+		if err != nil {
+			return nil, err
+		}
+		for _, kyou := range kyous {
+			if kyou.ID != "" {
+				if _, exist := seen[kyou.ID]; exist {
+					continue
+				}
+				seen[kyou.ID] = struct{}{}
+			}
+			collected = append(collected, kyou)
+		}
+	}
+	return collected, nil
+}
+
+// window は取得を分割する期間。両端を含む。
+type window struct {
+	start time.Time
+	end   time.Time
+}
+
+// splitIntoWindows は取得範囲を新しい側から windowDays 幅で刻む。
+//
+// 開始が決まっていないときは分割できないので空を返す（呼び出し元は従来どおり1回で取る）。
+// 端は両端を含む形にしてあるので、境目ちょうどの記録は両方の窓に現れる。
+// 取りこぼすより重複するほうが安全なので、これでよい（呼び出し元がIDで畳む）。
+func splitIntoWindows(start *time.Time, end *time.Time, windowDays int, now time.Time) []window {
+	if start == nil {
+		return nil
+	}
+	if windowDays <= 0 {
+		windowDays = defaultWindowDays
+	}
+
+	rangeEnd := now
+	if end != nil {
+		rangeEnd = *end
+	}
+	if !rangeEnd.After(*start) {
+		return nil
+	}
+
+	windows := []window{}
+	width := time.Duration(windowDays) * 24 * time.Hour
+	for windowEnd := rangeEnd; windowEnd.After(*start); windowEnd = windowEnd.Add(-width) {
+		windowStart := windowEnd.Add(-width)
+		if windowStart.Before(*start) {
+			windowStart = *start
+		}
+		windows = append(windows, window{start: windowStart, end: windowEnd})
+	}
+	return windows
+}
+
+// fetchKyousInWindow は1つの期間ぶんをカーソルで取り切る。
+// alreadyCollected は MaxTotal を窓をまたいで数えるための、ここまでに取れた件数。
+func (c *Client) fetchKyousInWindow(ctx context.Context, query *FindQuery, options FetchOptions, alreadyCollected int) ([]Kyou, error) {
 	pageLimit := options.PageLimit
 	if pageLimit <= 0 {
 		pageLimit = defaultPageLimit
@@ -64,13 +161,13 @@ func (c *Client) FetchKyous(ctx context.Context, query *FindQuery, options Fetch
 	cursor := ""
 
 	for {
-		if options.MaxTotal > 0 && len(collected) >= options.MaxTotal {
+		if options.MaxTotal > 0 && alreadyCollected+len(collected) >= options.MaxTotal {
 			break
 		}
 
 		requestLimit := pageLimit
 		if options.MaxTotal > 0 {
-			remaining := options.MaxTotal - len(collected)
+			remaining := options.MaxTotal - (alreadyCollected + len(collected))
 			if remaining < requestLimit {
 				requestLimit = remaining
 			}
