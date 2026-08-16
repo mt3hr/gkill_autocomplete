@@ -736,3 +736,63 @@ func TestAnalyzeStopsAfterConsecutiveFailures(t *testing.T) {
 		t.Errorf("評価済みの記録 = %d件, want 0件 (打ち切っても次にやり直せること)", len(evaluated))
 	}
 }
+
+// unsupportedFormatClassifier は視覚モデルが復号できない画像を模す判定器。
+type unsupportedFormatClassifier struct {
+	calls int
+}
+
+func (c *unsupportedFormatClassifier) Classify(_ context.Context, _ suggest.Record, _ []suggest.Candidate) ([]suggest.Judgement, error) {
+	c.calls++
+	return nil, fmt.Errorf("判定できません: %w", gkillclient.ErrUnsupportedImageFormat)
+}
+
+// TestAnalyzeMarksUnjudgeableRecordsAsEvaluated は、視覚モデルが復号できない形式を
+// 失敗ではなく確定した答えとして扱うことを確かめる。
+//
+// RAW(.cr2)や .webp は何度やり直しても判定できない。失敗のままにすると
+// 評価済みにならないので、毎回の解析でサムネイルの取得だけをやり直すことになる
+// (実データで9,000件超ある)。さらに連続失敗として数えると、データの都合で
+// 解析そのものが打ち切られてしまう（2026-08-16 に実際に起きた）。
+func TestAnalyzeMarksUnjudgeableRecordsAsEvaluated(t *testing.T) {
+	// タグ付きを多めに置く理由は TestAnalyzeDoesNotStopAtFirstFailure と同じ。
+	kyous := []map[string]any{}
+	for i := range 20 {
+		kyous = append(kyous, kyouJSON(fmt.Sprintf("past-%d", i), at(5, 8, i), []string{"タグA"}, fmt.Sprintf("むかしの本文%d", i)))
+	}
+	// 打ち切りの閾値より多く並べる。打ち切られたら本数が足りなくなる。
+	for i := range maxConsecutiveJudgeFailures + 5 {
+		kyous = append(kyous, kyouJSON(fmt.Sprintf("new-%d", i), at(9, 10, i), nil, fmt.Sprintf("本文%d", i)))
+	}
+
+	appConfig := config.Default()
+	appConfig.Candidates.MinExamples = 1
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+	classifier := &unsupportedFormatClassifier{}
+	application.Classifier = classifier
+	noJudgeRetryWait(t)
+
+	report, err := application.Analyze(context.Background())
+	if err != nil {
+		t.Fatalf("復号できない形式は失敗ではないのに解析が打ち切られた: %v", err)
+	}
+	if report.UnjudgeableRecords != report.CandidateRecords || report.CandidateRecords == 0 {
+		t.Fatalf("判定できない形式 = %d件 / 対象 %d件, want 全件", report.UnjudgeableRecords, report.CandidateRecords)
+	}
+	if report.FailedRecords != 0 {
+		t.Errorf("失敗した記録 = %d件, want 0件 (これは失敗ではない)", report.FailedRecords)
+	}
+	if classifier.calls != report.CandidateRecords {
+		t.Errorf("判定器の呼び出し = %d回, want %d回 (やり直さないはず)", classifier.calls, report.CandidateRecords)
+	}
+
+	// **評価済みにする。** そうしないと次の解析でまた取得からやり直すことになる。
+	evaluated, err := application.Store.EvaluatedTargetIDs(context.Background(), testUserID)
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+	if len(evaluated) != report.CandidateRecords {
+		t.Errorf("評価済み = %d件, want %d件 (二度と候補に挙げないため)", len(evaluated), report.CandidateRecords)
+	}
+}

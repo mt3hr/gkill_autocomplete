@@ -47,6 +47,17 @@ const (
 // テストが待たされないよう var にしてある(テストからは0にする)。
 var judgeRetryWait = 10 * time.Second
 
+// isUnjudgeableRecordError は「この記録は永久に判定できない」ことを表す失敗かを返す。
+//
+// 視覚モデルが復号できない画像形式(RAW・webp など)と、gkill が画像として
+// 返さなかったもの(動画・書庫・書類)が該当する。どちらも記録側の性質なので、
+// やり直しても環境を直しても結果は変わらない。失敗として数えず、
+// 連続失敗による打ち切りにも数えない(データの都合で解析を止めない)。
+func isUnjudgeableRecordError(err error) bool {
+	return errors.Is(err, gkillclient.ErrUnsupportedImageFormat) ||
+		errors.Is(err, gkillclient.ErrNotAnImage)
+}
+
 // isRetryableJudgeError はやり直す価値のある失敗かを返す。
 //
 // 繋がらない・時間切れ・LLMがエラーを返した、の3つは環境側の一時的な事情
@@ -176,6 +187,11 @@ type AnalyzeReport struct {
 	// LLM の応答が解釈できない・写真が取れない・1件が時間切れになる、
 	// といったことは実際に起きる。1件のために残り全部を捨てるほうが害が大きい。
 	FailedRecords int
+	// UnjudgeableRecords は判定しようがなかった記録の数。
+	//
+	// 視覚モデルが復号できない形式なので失敗ではない。評価済みにして
+	// 二度と候補に挙げないため、次の解析では出てこない。
+	UnjudgeableRecords int
 	// FailureReason は最も多かった失敗の理由。
 	//
 	// **決め打ちの文字列しか入らない。** エラー本文には LLM の応答や
@@ -251,6 +267,9 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 	// 続けて失敗した回数。1件でも判定できたら0に戻す。
 	consecutiveFailures := 0
 
+	// 判定できない形式のログは最初の1回だけ出す。9,000件超あるので全部出すと埋まる。
+	unjudgeableLogged := 0
+
 	for index, candidate := range candidates {
 		// 中断は中断として扱う。利用者が止めたか、終了しようとしている。
 		if err := ctx.Err(); err != nil {
@@ -260,6 +279,29 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 		neighbors := neighborsOf(sorted, candidate, window)
 
 		result, err := a.judgeWithRetry(ctx, engine, candidate, neighbors)
+
+		// **判定できない形式は「失敗」ではなく確定した答えとして扱う。**
+		// RAW(.cr2)や .webp、動画・書庫・書類は視覚モデルに渡しようがなく、
+		// 何度やり直しても結果は変わらない。失敗のままにすると、
+		// 評価済みにならないので毎回の解析で取得だけやり直すことになる
+		// (実データで9,000件超あり、毎回それだけサムネを引き直す)。
+		// 評価済みにして二度と候補に挙げない。
+		if isUnjudgeableRecordError(err) {
+			report.UnjudgeableRecords++
+			if unjudgeableLogged == 0 {
+				a.logger().Info("判定できない形式の記録は評価済みにして次へ進みます",
+					slog.Int("何件目", index+1),
+					slog.Int("判定する記録", len(candidates)))
+			}
+			unjudgeableLogged++
+			if err := a.Store.MarkEvaluated(ctx, a.UserID(), candidate.ID, suggest.TierUnjudgeable, a.now()); err != nil {
+				return report, err
+			}
+			consecutiveFailures = 0
+			a.notifyProgress(onProgress, index+1, len(candidates))
+			continue
+		}
+
 		if err != nil {
 			// **1件の失敗で残り全部を捨てない。**
 			// 判定は記録ごとに独立しているので、失敗した1件を飛ばせば済む。
@@ -349,6 +391,7 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 	a.logger().Info("解析が終わりました",
 		slog.Int("提案が出た記録", report.SuggestedRecords),
 		slog.Int("提案が出なかった記録", report.NoSuggestionRecords),
+		slog.Int("判定できない形式の記録", report.UnjudgeableRecords),
 		slog.Int("保存した提案", report.StoredSuggestions),
 		slog.Int("判定に失敗した記録", report.FailedRecords),
 		slog.Duration("所要時間", report.Elapsed))

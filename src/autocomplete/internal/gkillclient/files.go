@@ -1,6 +1,7 @@
 package gkillclient
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -59,6 +60,16 @@ func escapePathSegments(path string) string {
 // 原本をそのまま 200 で返す。動画・書庫・書類のいずれでも起きる。
 // 素通しにすると、動画1本を maxImageBytes まで読み込むことになる。
 var ErrNotAnImage = errors.New("gkill が画像でないものを返しました")
+
+// ErrUnsupportedImageFormat は視覚モデルが復号できない画像形式を表す。
+//
+// **gkill が画像として返してきても、視覚モデルが読めるとは限らない。**
+// gkill は拡張子で画像かを決めるので、RAW(.cr2)や .webp も image/* で返る。
+// llama.cpp の復号器(stb_image)が扱えるのは JPEG / PNG / GIF / BMP だけで、
+// それ以外を送ると復号に失敗し「LLM がエラーを返した」という
+// 環境の問題に見える形で返ってくる。
+// これは記録側の性質で、何度やり直しても結果は変わらない。
+var ErrUnsupportedImageFormat = errors.New("視覚モデルが復号できない画像形式です")
 
 // Image は取得した画像。
 type Image struct {
@@ -152,5 +163,38 @@ func (c *Client) fetchFile(ctx context.Context, requestURL string, sessionID str
 		return Image{}, 0, fmt.Errorf("error at read file body: %w", err)
 	}
 
+	// **Content-Type だけでは足りない。中身のバイト列も見る。**
+	// gkill は RAW(.cr2)や .webp も画像として image/* で返すが、
+	// 視覚モデル側(llama.cpp の stb_image)はこれらを復号できない。
+	// 送ってしまうと「LLM がエラーを返した」という環境の問題に見える形で
+	// 失敗し、実際には永久に判定できない記録のために毎回やり直すことになる。
+	// 2026-08-16 の実データで .cr2 が 7,627件、.webp が 1,446件あり、
+	// 固まって並んでいるため連続失敗で解析が打ち切られた。
+	if !isDecodableImage(body) {
+		return Image{}, http.StatusOK, fmt.Errorf(
+			"%w (Content-Type %q)。視覚モデルが復号できるのは JPEG / PNG / GIF / BMP だけです",
+			ErrUnsupportedImageFormat, contentType)
+	}
+
 	return Image{Bytes: body, ContentType: contentType}, http.StatusOK, nil
+}
+
+// isDecodableImage は視覚モデルが復号できる形式かを先頭バイトで判定する。
+//
+// 拡張子でも Content-Type でもなく実体を見る。gkill は拡張子で画像かを決めており、
+// RAW も画像として image/* で返してくるため、型情報は当てにならない。
+// 見るのは先頭の数バイトだけ。長さで足切りはしない
+// (短いものを弾く判定にすると、短い正当なヘッダを持つ検査用の画像まで落ちる)。
+func isDecodableImage(body []byte) bool {
+	switch {
+	case bytes.HasPrefix(body, []byte{0xFF, 0xD8}): // JPEG
+		return true
+	case bytes.HasPrefix(body, []byte{0x89, 'P', 'N', 'G'}): // PNG
+		return true
+	case bytes.HasPrefix(body, []byte("GIF8")): // GIF
+		return true
+	case bytes.HasPrefix(body, []byte("BM")): // BMP
+		return true
+	}
+	return false
 }
