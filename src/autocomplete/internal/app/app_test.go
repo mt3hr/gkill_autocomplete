@@ -317,6 +317,8 @@ func TestAnalyzeReportsWhyEveryRecordFailed(t *testing.T) {
 	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
 	// LLM が起動していない状況を模す。
 	application.Classifier = &unreachableClassifier{}
+	// 繋がらないエラーはやり直しの対象なので、待ち時間を潰しておく。
+	noJudgeRetryWait(t)
 
 	report, err := application.Analyze(context.Background())
 	if err != nil {
@@ -610,5 +612,127 @@ func TestAnalyzeExcludesMachineAppliedTags(t *testing.T) {
 	}
 	if report.StoredSuggestions != 0 {
 		t.Errorf("除外したはずのタグを提案している: %d件", report.StoredSuggestions)
+	}
+}
+
+// noJudgeRetryWait はやり直しの待ち時間を潰す。
+// 実運用では10秒あけるが、テストで待つ意味は無い。
+func noJudgeRetryWait(t *testing.T) {
+	t.Helper()
+	original := judgeRetryWait
+	judgeRetryWait = 0
+	t.Cleanup(func() { judgeRetryWait = original })
+}
+
+// flakyClassifier は指定回数だけ失敗し、そのあと成功する判定器。
+type flakyClassifier struct {
+	failTimes int
+	calls     int
+}
+
+func (c *flakyClassifier) Classify(_ context.Context, _ suggest.Record, candidates []suggest.Candidate) ([]suggest.Judgement, error) {
+	c.calls++
+	if c.calls <= c.failTimes {
+		return nil, fmt.Errorf("%w: dial tcp 127.0.0.1:11434: connection refused", llm.ErrUnreachable)
+	}
+	judgements := make([]suggest.Judgement, 0, len(candidates))
+	for _, candidate := range candidates {
+		judgements = append(judgements, suggest.Judgement{Tag: candidate.Tag, Yes: false})
+	}
+	return judgements, nil
+}
+
+// TestAnalyzeRetriesTemporaryFailure は、一時的な失敗をやり直すことを確かめる。
+//
+// LLM の入れ替え中は「繋がらない」が数十秒つづく。やり直さないと、
+// その間に当たった記録が失敗として捨てられる。
+func TestAnalyzeRetriesTemporaryFailure(t *testing.T) {
+	kyous := []map[string]any{
+		kyouJSON("past-1", at(5, 8, 0), []string{"タグA"}, "むかしの本文"),
+		kyouJSON("past-2", at(5, 8, 1), []string{"タグA"}, "むかしの本文2"),
+		kyouJSON("past-3", at(5, 8, 2), []string{"タグA"}, "むかしの本文3"),
+		kyouJSON("past-4", at(5, 8, 3), []string{"タグA"}, "むかしの本文4"),
+		kyouJSON("past-5", at(5, 8, 4), []string{"タグA"}, "むかしの本文5"),
+		kyouJSON("new-1", at(9, 10, 0), nil, "ひとつめ"),
+	}
+
+	appConfig := config.Default()
+	appConfig.Candidates.MinExamples = 1
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+	// 1回目だけ失敗し、2回目で成功する。
+	classifier := &flakyClassifier{failTimes: 1}
+	application.Classifier = classifier
+	noJudgeRetryWait(t)
+
+	report, err := application.Analyze(context.Background())
+	if err != nil {
+		t.Fatalf("やり直せば成功するのに解析が落ちている: %v", err)
+	}
+	if classifier.calls < 2 {
+		t.Errorf("判定器の呼び出し = %d回, want 2回以上 (1回目の失敗をやり直すはず)", classifier.calls)
+	}
+	if report.FailedRecords != 0 {
+		t.Errorf("判定に失敗した記録 = %d件, want 0件 (やり直して成功するはず)", report.FailedRecords)
+	}
+
+	// やり直して成功した記録は評価済みになる。
+	evaluated, err := application.Store.EvaluatedTargetIDs(context.Background(), testUserID)
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+	if len(evaluated) == 0 {
+		t.Error("評価済みの記録が0件。やり直して成功した記録は評価済みにするはず")
+	}
+}
+
+// TestAnalyzeStopsAfterConsecutiveFailures は、失敗が続いたら打ち切ることを確かめる。
+//
+// **これを落とすと「完走したように見えて何も判定していない」に戻る。**
+// 2026-08-16、LLM を入れ替えた1分のあいだに残り12,425件すべてが
+// 「LLMに繋がらない」で失敗として流れ、それでも「解析が終わりました」と出た。
+// 続けて失敗するのは記録ではなく環境の問題なので、走り続けても候補を
+// 消費するだけで何も判定できない。飛ばした記録は評価済みにしないので、
+// 打ち切っても失われるものは無い。
+func TestAnalyzeStopsAfterConsecutiveFailures(t *testing.T) {
+	// タグ付きを多めに置く理由は TestAnalyzeDoesNotStopAtFirstFailure と同じ。
+	// 未タグ率が高いと LLM の段階へ行く前に打ち切られ、そもそも失敗しない。
+	kyous := []map[string]any{}
+	for i := range 20 {
+		kyous = append(kyous, kyouJSON(fmt.Sprintf("past-%d", i), at(5, 8, i), []string{"タグA"}, fmt.Sprintf("むかしの本文%d", i)))
+	}
+	// 打ち切りの閾値より多い候補を並べる。全部走り抜けたら打ち切っていない。
+	for i := range maxConsecutiveJudgeFailures + 5 {
+		kyous = append(kyous, kyouJSON(fmt.Sprintf("new-%d", i), at(9, 10, i), nil, fmt.Sprintf("本文%d", i)))
+	}
+
+	appConfig := config.Default()
+	appConfig.Candidates.MinExamples = 1
+
+	application := newTestApp(t, newAnalyzeTestServer(t, kyous), appConfig)
+	application.Classifier = &unreachableClassifier{}
+	noJudgeRetryWait(t)
+
+	report, err := application.Analyze(context.Background())
+	if err == nil {
+		t.Fatal("失敗が続いたのに解析が成功として終わっている（完走に見えて何も判定していない状態になる）")
+	}
+	if !strings.Contains(err.Error(), "打ち切り") {
+		t.Errorf("エラー = %q, want 「打ち切り」を含む", err.Error())
+	}
+	if report.FailedRecords > maxConsecutiveJudgeFailures {
+		t.Errorf("失敗した記録 = %d件, want %d件以下 (閾値で止まるはず)", report.FailedRecords, maxConsecutiveJudgeFailures)
+	}
+	if !strings.Contains(report.FailureReason, "LLM に繋がらない") {
+		t.Errorf("理由 = %q, want 「LLM に繋がらない」を含む", report.FailureReason)
+	}
+
+	// 打ち切っても、飛ばした記録は評価済みにしない。次の解析でやり直せる。
+	evaluated, err := application.Store.EvaluatedTargetIDs(context.Background(), testUserID)
+	if err != nil {
+		t.Fatalf("想定外のエラー: %v", err)
+	}
+	if len(evaluated) != 0 {
+		t.Errorf("評価済みの記録 = %d件, want 0件 (打ち切っても次にやり直せること)", len(evaluated))
 	}
 }

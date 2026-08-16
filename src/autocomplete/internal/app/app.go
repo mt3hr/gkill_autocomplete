@@ -23,6 +23,66 @@ import (
 	"github.com/mt3hr/gkill_autocomplete/src/autocomplete/internal/suggest"
 )
 
+const (
+	// maxJudgeAttempts は1件の判定をやり直す回数(初回を含む)。
+	//
+	// LLM が落ちている間、繋がらないエラーは**即座に**返る。やり直さずに次の記録へ
+	// 進むと、候補リストの最後まで1分あたり数千件の速さで「失敗」を積み上げてしまう。
+	// 2026-08-16 に llama-server を入れ替えた1分のあいだ、残り12,425件すべてが
+	// 失敗として流れ、それでも「解析が終わりました」と出て完走扱いになった。
+	maxJudgeAttempts = 3
+
+	// maxConsecutiveJudgeFailures は解析を打ち切るまでの連続失敗数。
+	//
+	// 1件ごとの失敗は飛ばして進んでよい(判定は記録ごとに独立している)が、
+	// 続けて失敗するのは記録ではなく環境の問題なので、そのまま走り続けても
+	// 候補を消費するだけで何も判定できない。**飛ばした記録は評価済みにしないので、
+	// 打ち切っても失われるものは無い**(次の解析でやり直される)。
+	maxConsecutiveJudgeFailures = 5
+)
+
+// judgeRetryWait はやり直しの間隔。
+//
+// モデルの読み込み直しは数十秒かかるので、間を置かないと3回とも同じ瞬間に当たる。
+// テストが待たされないよう var にしてある(テストからは0にする)。
+var judgeRetryWait = 10 * time.Second
+
+// isRetryableJudgeError はやり直す価値のある失敗かを返す。
+//
+// 繋がらない・時間切れ・LLMがエラーを返した、の3つは環境側の一時的な事情
+// (プロセスの入れ替え、モデルの読み込み中、一時的な過負荷)で起きうる。
+// 応答を解釈できない・画像でないファイル、は同じ入力なら何度やっても同じなので
+// やり直さない(無駄に3倍の時間を使うだけになる)。
+func isRetryableJudgeError(err error) bool {
+	return errors.Is(err, llm.ErrUnreachable) ||
+		errors.Is(err, llm.ErrTimeout) ||
+		errors.Is(err, llm.ErrRejected)
+}
+
+// judgeWithRetry は1件の判定を、一時的な失敗のときだけやり直す。
+func (a *App) judgeWithRetry(ctx context.Context, engine *suggest.Engine, candidate suggest.Record, neighbors []suggest.Record) (suggest.Result, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxJudgeAttempts; attempt++ {
+		result, err := engine.Suggest(ctx, candidate, neighbors)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isRetryableJudgeError(err) {
+			return suggest.Result{}, err
+		}
+		if attempt == maxJudgeAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return suggest.Result{}, ctx.Err()
+		case <-time.After(judgeRetryWait):
+		}
+	}
+	return suggest.Result{}, lastErr
+}
+
 // warnIfScanTruncated は取得が上限で打ち切られたことを知らせる。
 //
 // 打ち切られると学習が不完全なまま「正常終了」に見えてしまう。
@@ -188,6 +248,9 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 	// 失敗の理由ごとの件数。決め打ちの文字列だけを鍵にする。
 	failureCounts := map[string]int{}
 
+	// 続けて失敗した回数。1件でも判定できたら0に戻す。
+	consecutiveFailures := 0
+
 	for index, candidate := range candidates {
 		// 中断は中断として扱う。利用者が止めたか、終了しようとしている。
 		if err := ctx.Err(); err != nil {
@@ -196,7 +259,7 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 
 		neighbors := neighborsOf(sorted, candidate, window)
 
-		result, err := engine.Suggest(ctx, candidate, neighbors)
+		result, err := a.judgeWithRetry(ctx, engine, candidate, neighbors)
 		if err != nil {
 			// **1件の失敗で残り全部を捨てない。**
 			// 判定は記録ごとに独立しているので、失敗した1件を飛ばせば済む。
@@ -222,9 +285,26 @@ func (a *App) AnalyzeWithProgress(ctx context.Context, onProgress func(Progress)
 					slog.Int("何件目", index+1),
 					slog.Int("判定する記録", len(candidates)))
 			}
+
+			// **続けて失敗するなら打ち切る。**
+			// 記録ではなく環境の問題なので、走り続けても候補を消費するだけで
+			// 何も判定できない。飛ばした記録は評価済みにしていないので、
+			// ここで止めても失われるものは無い。
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsecutiveJudgeFailures {
+				report.FailureReason = mostCommonReason(failureCounts)
+				a.logger().Error("判定が続けて失敗したため解析を打ち切りました。原因を直してからやり直してください",
+					slog.Int("続けて失敗した回数", consecutiveFailures),
+					slog.String("理由", reason),
+					slog.Int("判定できた記録", index+1-report.FailedRecords),
+					slog.Int("判定する記録", len(candidates)))
+				return report, fmt.Errorf("判定が%d件続けて失敗したため解析を打ち切りました: %s", consecutiveFailures, reason)
+			}
+
 			a.notifyProgress(onProgress, index+1, len(candidates))
 			continue
 		}
+		consecutiveFailures = 0
 
 		if len(result.Suggestions) == 0 {
 			report.NoSuggestionRecords++
