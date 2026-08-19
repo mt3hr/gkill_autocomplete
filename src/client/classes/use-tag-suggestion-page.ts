@@ -42,6 +42,9 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
     const is_analyzing = ref(false)
     const is_deciding = ref(false)
     const pending_count = ref(0)
+    // skipped_count は「中身を取りに行ったのに gkill から返ってこなかった」記録の数。
+    // 一覧が空のときの言い分けに使う。
+    const skipped_count = ref(0)
     const messages: Ref<AlertMessage[]> = ref([])
 
     // analyze_done / analyze_total は解析の進み具合。
@@ -122,6 +125,7 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
             const response = await fetch_suggestions()
             records.value = response.records
             pending_count.value = response.pending
+            skipped_count.value = response.skipped ?? 0
             focused_index.value = 0
             reset_selection()
         } catch (error) {
@@ -306,6 +310,13 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
             } else {
                 push_message(`${approve.join('、')} を付けました`, false)
             }
+
+            // 一覧はサーバが返した先頭ぶんしか持っていない。
+            // 見えている分を捌き切っても確認待ちが残っているなら続きを取りに行く。
+            // これが無いと、まだ数千件あるのに「確認待ちの提案はありません」になる。
+            if (records.value.length === 0 && response.pending > 0) {
+                void load()
+            }
         } catch (error) {
             records.value = [
                 ...records.value.slice(0, removed_index),
@@ -441,6 +452,7 @@ export function useTagSuggestionPage(on_unauthorized: () => void) {
         is_dark_theme,
         has_records,
         pending_count,
+        skipped_count,
         analyze_done,
         analyze_total,
         messages,

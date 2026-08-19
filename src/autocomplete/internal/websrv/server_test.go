@@ -30,6 +30,10 @@ type fakeGkill struct {
 	addedTags chan gkillclient.Tag
 	kyous     []map[string]any
 	imageHits atomic.Int32
+
+	// onGetKyous は /api/get_kyous_mcp の応答を要求に応じて組み立てる差込口。
+	// nil なら kyous をそのまま返す。
+	onGetKyous func(requestedIDs []string) []map[string]any
 }
 
 func newFakeGkill(t *testing.T, kyous []map[string]any) *fakeGkill {
@@ -49,7 +53,17 @@ func newFakeGkill(t *testing.T, kyous []map[string]any) *fakeGkill {
 		case "/api/login":
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": nil, "session_id": "session-1"})
 		case "/api/get_kyous_mcp":
-			_ = json.NewEncoder(w).Encode(map[string]any{"errors": nil, "kyous": fake.kyous, "has_more": false})
+			kyous := fake.kyous
+			if fake.onGetKyous != nil {
+				request := struct {
+					Query struct {
+						IDs []string `json:"ids"`
+					} `json:"query"`
+				}{}
+				_ = json.NewDecoder(r.Body).Decode(&request)
+				kyous = fake.onGetKyous(request.Query.IDs)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": nil, "kyous": kyous, "has_more": false})
 		case "/api/add_tag":
 			request := struct {
 				Tag gkillclient.Tag `json:"tag"`

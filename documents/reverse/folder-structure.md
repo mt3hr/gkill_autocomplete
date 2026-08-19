@@ -46,7 +46,7 @@ gkill 本体の `documents/reverse/` と同じ分類にしてあります。行�
 ## `src/autocomplete/` — Go の本体
 
 module は `github.com/mt3hr/gkill_autocomplete/src/autocomplete`。`go.mod` はここに置きます。
-Go ファイルは **42ファイル**（うちテスト **15ファイル**）です。
+Go ファイルは **45ファイル**（うちテスト **18ファイル**）です。
 
 ```
 src/autocomplete/

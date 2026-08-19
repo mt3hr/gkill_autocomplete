@@ -28,6 +28,9 @@ export type SuggestionRecord = {
 export type SuggestionsResponse = {
     records: SuggestionRecord[]
     pending: number
+    // skipped は中身を取りに行ったのに gkill から返ってこなかった記録の数。
+    // 一覧が空のときに、片付いたのか取得が壊れたのかを言い分けるために使う。
+    skipped: number
 }
 
 export type DecideResponse = {

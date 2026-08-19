@@ -287,6 +287,31 @@ gkill 同梱の MCP 実装を雛形にすると踏む穴があります。
 | `idf` は画像とは限らない | `payload.is_image` を見る。偽の `idf` は写真も本文も持たないので、画面には `file_name` を出さないと空の札になる |
 | `/files/` の認証はクッキーのみ | `Cookie: gkill_session_id=<id>` が要る。ボディやクエリでは渡せない |
 | 業務エラーが HTTP 200 で返る | `errors` 配列を見る。**成功時は `[]` ではなく `null`** |
+| `query.ids` に何千件も渡すと、エラーではなく**空の結果**が返る | **500件ずつに割って渡す**。詳細は下記 |
+
+### `query.ids` は必ず分割して渡す
+
+`query.ids` に渡せる記録IDには**実質的な上限があり、超えてもエラーになりません**。
+
+gkill の Mi 検索は5射影（作成・チェック・期限・開始・終了）の `UNION` で、
+**5本それぞれに `ID IN (…)` の一覧を丸ごと展開します**
+（`dao/reps/mi_repository_sqlite3_impl.go`）。
+バインド変数は `5N + 5` になり、SQLite の上限 32766 を **N = 6553 で超えます**。
+
+実測（2026-08-18・稼働中の gkill に対して境界を挟んで確かめたもの）:
+
+| 渡したID数 | 結果 |
+| --- | --- |
+| 6552 | `total_count=6552`。正常 |
+| 6553 以上 | `total_count=0`・`errors: null`・**エラー無しで返る** |
+
+エラーにならないのは、`handle_get_kyous_mcp.go` が
+「`err` はあるが `GkillError` は無い」場合にレスポンスへ何も積まないまま返すためです
+（`err` は Debug レベルのログにしか出ません）。
+呼び出し側からは「成功・該当0件」と区別が付きません。
+
+このため `websrv.fetchRecords` は `fetchRecordsChunkSize`（500件）ずつに割って問い合わせます。
+回帰は `internal/websrv/suggestions_fetch_test.go` が固定しています。
 
 ### ページングの既定値
 

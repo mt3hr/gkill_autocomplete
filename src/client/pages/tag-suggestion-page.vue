@@ -26,6 +26,7 @@ const {
     is_dark_theme,
     has_records,
     pending_count,
+    skipped_count,
     analyze_done,
     analyze_total,
     messages,
@@ -110,6 +111,20 @@ function format_confidence(value: number): string {
                 <p class="mt-4">このアカウントは解析の対象に含まれていません。</p>
                 <p class="text-medium-emphasis">
                     対象にするには、起動時に <code>--user {{ props.user_id }}</code> を渡してください。
+                </p>
+            </div>
+
+            <!-- 確認待ちが残っているのに一覧が空。記録の中身を取り出せていない。
+                 「ありません」と出すと片付いたように見えてしまうので必ず言い分ける。 -->
+            <div v-else-if="!has_records && pending_count > 0" class="empty_state">
+                <v-icon size="48" color="warning">mdi-alert-outline</v-icon>
+                <p class="mt-4">確認待ちが {{ pending_count }}件ありますが、記録の中身を gkill から取り出せませんでした。</p>
+                <p class="text-medium-emphasis">
+                    gkill が動いているかを確かめてから、右上の読み直しボタンを押してください。
+                </p>
+                <p v-if="skipped_count > 0" class="text-medium-emphasis">
+                    そのうち {{ skipped_count }}件は gkill 側に見つかりませんでした
+                    (記録が消されている場合はこれで正常です)。
                 </p>
             </div>
 

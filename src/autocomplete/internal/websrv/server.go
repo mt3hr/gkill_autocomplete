@@ -259,7 +259,38 @@ type recordView struct {
 type suggestionsResponse struct {
 	Records []recordView `json:"records"`
 	Pending int          `json:"pending"`
+
+	// Skipped は「中身を取りに行ったのに gkill から返ってこなかった」記録の数。
+	//
+	// **0件の理由を画面が言い分けられるようにするためにある。**
+	// これが無いと、確認待ちが何千件あっても一覧が空なら
+	// 「確認待ちの提案はありません」としか出せず、
+	// 取得が壊れているのか本当に片付いているのかが区別できない。
+	Skipped int `json:"skipped"`
 }
+
+const (
+	// maxRecordsPerResponse は1回の一覧で中身まで取り出す記録の数。
+	//
+	// 画面は1件ずつ捌くので、確認待ち全部の中身を毎回引く必要はない。
+	// 全部引くと応答が大きくなるうえ、gkill 側の検索が数十秒かかる。
+	// 捌いて空になったら画面が読み直す(use-tag-suggestion-page.ts)。
+	maxRecordsPerResponse = 200
+
+	// fetchRecordsChunkSize は1回のリクエストで gkill へ渡す記録IDの数。
+	//
+	// ★IDの一覧は必ず分割して渡すこと。★
+	//
+	// gkill の Mi 検索は5射影の UNION で、5本それぞれに ID の一覧を丸ごと
+	// 展開する(dao/reps/mi_repository_sqlite3_impl.go)。バインド変数は 5N+5 に
+	// なり、SQLite の上限 32766 を **N=6553 で超える**(実測: 6552 は成功、
+	// 6553 で破綻)。しかも超えたときに返るのはエラーではなく **空の結果** で、
+	// gkill 側のハンドラが「err はあるが GkillError は無い」場合に
+	// レスポンスへ何も積まないまま return するため、HTTP 200 + errors:null に
+	// 見える。2026-08-18 に確認待ちが上限を超える件数まで溜まった状態で実際に踏み、
+	// 「確認待ちは残っているのに一覧だけが空」という形で表面化した。
+	fetchRecordsChunkSize = 500
+)
 
 func (s *Server) handleSuggestions(w http.ResponseWriter, r *http.Request, userID string) {
 	ctx := r.Context()
@@ -288,17 +319,22 @@ func (s *Server) handleSuggestions(w http.ResponseWriter, r *http.Request, userI
 		byTarget[suggestion.TargetID] = append(byTarget[suggestion.TargetID], suggestion)
 	}
 
-	records, err := s.fetchRecords(ctx, application, order)
+	records, examined, err := s.fetchRecords(ctx, application, order, maxRecordsPerResponse)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
 
 	response := suggestionsResponse{Records: []recordView{}, Pending: len(pending)}
-	for _, targetID := range order {
+	// 中身を取りに行った範囲だけを見る。まだ取りに行っていない残りは
+	// 「消えた記録」ではないので Skipped に数えてはいけない。
+	for _, targetID := range order[:examined] {
 		record, ok := records[targetID]
 		if !ok {
-			// gkill 側から消えた記録。画面には出さない。
+			// gkill 側から消えた記録。画面には出さないが、数だけは伝える。
+			// 黙って捨てると、取得そのものが壊れたときに
+			// 「確認待ちは片付いた」と見分けが付かなくなる。
+			response.Skipped++
 			continue
 		}
 
@@ -338,27 +374,36 @@ func (s *Server) handleSuggestions(w http.ResponseWriter, r *http.Request, userI
 // 提案の保存先には記録の中身を置いていない。画面に出すものは
 // そのつど取り直すことで、gkill 側で消したり直したりした結果が
 // そのまま反映される。
-func (s *Server) fetchRecords(ctx context.Context, application *app.App, targetIDs []string) (map[string]suggest.Record, error) {
-	if len(targetIDs) == 0 {
-		return map[string]suggest.Record{}, nil
-	}
+//
+// targetIDs は新しい順。want 件ぶん取れた時点で打ち切り、
+// 実際に見に行った件数を第2の戻り値で返す。
+// **IDは fetchRecordsChunkSize ずつに割って渡す。** 理由は同定数のコメントを見ること。
+// 取りに行った範囲で返ってこなかったIDは「gkill 側から消えた記録」で、
+// 呼び出し元が数える。
+func (s *Server) fetchRecords(ctx context.Context, application *app.App, targetIDs []string, want int) (map[string]suggest.Record, int, error) {
+	records := map[string]suggest.Record{}
+	index := map[string]imageLocation{}
 
-	kyous, err := application.Client.FetchKyous(ctx, &gkillclient.FindQuery{
-		IDs:            targetIDs,
-		OnlyLatestData: true,
-	}, gkillclient.FetchOptions{IncludeID: true})
-	if err != nil {
-		return nil, err
-	}
+	examined := 0
+	for examined < len(targetIDs) && len(records) < want {
+		end := min(examined+fetchRecordsChunkSize, len(targetIDs))
 
-	records := make(map[string]suggest.Record, len(kyous))
-	index := make(map[string]imageLocation, len(kyous))
-	for _, kyou := range kyous {
-		record := suggest.FromKyou(kyou)
-		records[record.ID] = record
-		if record.IsImage && record.FileName != "" {
-			index[record.ID] = imageLocation{RepName: record.RepName, FileName: record.FileName}
+		kyous, err := application.Client.FetchKyous(ctx, &gkillclient.FindQuery{
+			IDs:            targetIDs[examined:end],
+			OnlyLatestData: true,
+		}, gkillclient.FetchOptions{IncludeID: true})
+		if err != nil {
+			return nil, 0, err
 		}
+
+		for _, kyou := range kyous {
+			record := suggest.FromKyou(kyou)
+			records[record.ID] = record
+			if record.IsImage && record.FileName != "" {
+				index[record.ID] = imageLocation{RepName: record.RepName, FileName: record.FileName}
+			}
+		}
+		examined = end
 	}
 
 	// 索引はこの利用者のぶんだけ差し替える。他の利用者の索引は残す。
@@ -366,7 +411,7 @@ func (s *Server) fetchRecords(ctx context.Context, application *app.App, targetI
 	s.imageIndex[application.UserID()] = index
 	s.mu.Unlock()
 
-	return records, nil
+	return records, examined, nil
 }
 
 type decideRequest struct {
