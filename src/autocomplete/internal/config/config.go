@@ -5,6 +5,8 @@
 // 限られていることの検証は Validate に閉じており、他の場所で判定しない。
 package config
 
+// 編集前に読む: .claude/skills/autocomplete-config-build-docs/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"encoding/json"
 	"fmt"

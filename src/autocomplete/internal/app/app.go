@@ -4,6 +4,8 @@
 // 出さない(利用者の生活の記録そのものであるため)。
 package app
 
+// 編集前に読む: .claude/skills/autocomplete-analyze-run/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"context"
 	"errors"

@@ -1,6 +1,8 @@
 // コンポーネントは vite-plugin-vuetify (autoImport) がテンプレートでの
 // 使用箇所を見て個別に import する。ここで一括登録すると未使用のものまで
 // 全部バンドルされるので登録しない。gkill 本体と同じ方針。
+
+// 編集前に読む: .claude/skills/autocomplete-client-pwa/SKILL.md（この領域の不変条件の正本）
 import 'vuetify/styles'
 import { createVuetify, type ThemeDefinition } from 'vuetify'
 import { aliases, mdi } from 'vuetify/iconsets/mdi'

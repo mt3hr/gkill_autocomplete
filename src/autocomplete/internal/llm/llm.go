@@ -7,6 +7,8 @@
 // ここでは「渡されたものを送る」だけで、どこへ送ってよいかの判断はしない。
 package llm
 
+// 編集前に読む: .claude/skills/autocomplete-suggest/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"bytes"
 	"context"

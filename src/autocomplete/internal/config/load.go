@@ -1,5 +1,7 @@
 package config
 
+// 編集前に読む: .claude/skills/autocomplete-config-build-docs/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"encoding/json"
 	"errors"

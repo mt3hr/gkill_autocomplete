@@ -23,6 +23,8 @@
 // 片方の判定がもう片方を上書きしてしまう。
 package store
 
+// 編集前に読む: .claude/skills/autocomplete-store/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"context"
 	"database/sql"

@@ -1,5 +1,7 @@
 package gkillclient
 
+// 編集前に読む: .claude/skills/autocomplete-gkill-client/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"bytes"
 	"context"

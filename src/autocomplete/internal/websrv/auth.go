@@ -1,5 +1,7 @@
 package websrv
 
+// 編集前に読む: .claude/skills/autocomplete-gkill-auth/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"crypto/rand"
 	"encoding/hex"

@@ -10,6 +10,8 @@
 // requireAuth を通し、保存先への問い合わせは必ず利用者IDで絞る。
 package websrv
 
+// 編集前に読む: .claude/skills/autocomplete-websrv/SKILL.md（この領域の不変条件の正本）
+
 import (
 	"context"
 	"encoding/json"
