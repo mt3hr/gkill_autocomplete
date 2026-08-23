@@ -18,6 +18,25 @@ import (
 // 後からこのツールが付けたタグを見分けられるようにするためのもの。
 const AppName = "gkill_autocomplete"
 
+// maxResponseBytes は非2xxのときに本文を読む上限。
+// gkill 形式なら業務エラーとして返すので、errors 配列が入る程度には要る。
+const maxResponseBytes = 1 * 1024 * 1024
+
+// looksLikeGkillEnvelope は本文が gkill の応答形式(errors / messages を持つ JSON)かを返す。
+//
+// ステータスが 2xx でなくても、この形なら業務エラーとして呼び出し側へ渡す。
+// 呼び出し側は decodeEnvelope で errors を読み、今までどおり error_code で判断する。
+func looksLikeGkillEnvelope(body []byte) bool {
+	var probe struct {
+		Errors   json.RawMessage `json:"errors"`
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	return probe.Errors != nil || probe.Messages != nil
+}
+
 // maxErrorBodyBytes はエラー時にレスポンス本文を読む上限。
 // 記録の本文が丸ごとエラーメッセージに乗ってログへ流れるのを防ぐ。
 const maxErrorBodyBytes = 512
@@ -213,8 +232,22 @@ func (c *Client) postRaw(ctx context.Context, path string, body any) ([]byte, er
 	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusOK {
-		// 本文には記録の中身が入りうるので、読む量を絞る。
-		peeked, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes))
+		// **gkill 形式の本文なら、ステータスに関わらず呼び出し側へ返す。**
+		// gkill は 2026-08 から異常時に 4xx/5xx を返すが(ADR-0045)、
+		// エラーの中身(error_code)は今までどおり本文の errors にしか入っていない。
+		// ここで打ち切ると callAuthed の hasAuthError に到達せず、
+		// **セッションの取り直しが一度も走らなくなる**。
+		// AddTag の「既存タグは成功扱い」(IsAlreadyExistTag)も同じ理由で効かなくなる。
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
+		if readErr == nil && looksLikeGkillEnvelope(body) {
+			return body, nil
+		}
+
+		// 本文には記録の中身が入りうるので、エラー文へ載せる量は絞る。
+		peeked := body
+		if len(peeked) > maxErrorBodyBytes {
+			peeked = peeked[:maxErrorBodyBytes]
+		}
 
 		// TLS で待っているサーバに平文で繋いだ場合。接続先の書き方を直せば済む。
 		if strings.Contains(string(peeked), "HTTP request to an HTTPS server") {
@@ -233,6 +266,10 @@ func (c *Client) postRaw(ctx context.Context, path string, body any) ([]byte, er
 		}
 
 		if response.StatusCode == http.StatusForbidden {
+			// gkill は 403 を認可の拒否全般(管理者権限なし・アカウント無効)にも使うようになった。
+			// ただしその場合は本文が gkill 形式なので上で返っている。
+			// ここへ来るのは本文が読めない 403 —— つまりローカル限定アクセスで
+			// 前段のフィルタに弾かれた場合がほとんど。
 			return nil, fmt.Errorf(
 				"gkill が %s へのアクセスを拒否しました (HTTP 403)。"+
 					"gkill 側でローカル限定アクセスが有効な場合、同じ端末からでないと通りません", path)

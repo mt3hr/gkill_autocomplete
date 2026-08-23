@@ -104,8 +104,15 @@ func (c *Client) FetchThumb(ctx context.Context, repName string, fileName string
 	if err != nil {
 		return Image{}, err
 	}
-	if status == http.StatusForbidden {
+	if status == http.StatusForbidden || status == http.StatusUnauthorized {
 		// セッションが死んでいる可能性がある。取り直して1回だけやり直す。
+		//
+		// **401 も見る。** /files/ は今のところ未認証を 403 で返すが、
+		// gkill は 2026-08 から認証の失敗を 401 で表すようになった(ADR-0045)。
+		// ここはステータスで判定している数少ない場所なので、
+		// 片方だけ見ているとセッションの取り直しが黙って走らなくなる。
+		// なお「リポジトリの取得に失敗した」は 500 になったので、ここでは再試行しない
+		// (セッションの問題ではないため。やり直しても同じ結果になる)。
 		c.sessions.Invalidate(ctx)
 
 		sessionID, err = c.EnsureSession(ctx)

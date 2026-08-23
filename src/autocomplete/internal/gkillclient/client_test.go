@@ -69,6 +69,15 @@ func newTestClient(t *testing.T, handler http.Handler) (*Client, *fakeSessionSou
 	return client, sessions
 }
 
+// writeJSONBody は WriteHeader を呼んだあとの w へ本文だけを書く。
+// writeJSON はヘッダも書くので、ステータスを自分で決めるテストではこちらを使う。
+func writeJSONBody(t *testing.T, w http.ResponseWriter, body any) {
+	t.Helper()
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		t.Fatalf("レスポンスを書けない: %v", err)
+	}
+}
+
 // writeJSON はテスト用サーバのレスポンスを書く。
 func writeJSON(t *testing.T, w http.ResponseWriter, body any) {
 	t.Helper()
@@ -152,6 +161,104 @@ func TestSessionExpiredTriggersReissue(t *testing.T) {
 				t.Errorf("セッションの発行回数 = %d, want 2 (取り直していない)", got)
 			}
 		})
+	}
+}
+
+// gkill は 2026-08 から認証の失敗を 401 で返す(ADR-0045)。
+// エラーの中身は今までどおり本文の errors にしか入っていないので、
+// **ステータスで打ち切ると取り直しが一度も走らなくなる**。
+func TestSessionExpiredTriggersReissueWithHTTP401(t *testing.T) {
+	callCount := atomic.Int32{}
+
+	client, sessions := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if callCount.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			writeJSONBody(t, w, map[string]any{
+				"errors":   []map[string]string{{"error_code": ErrCodeSessionExpired, "error_message": "expired"}},
+				"messages": nil,
+			})
+			return
+		}
+		writeJSON(t, w, map[string]any{"errors": nil, "tag_names": []string{"タグA"}})
+	}))
+
+	tagNames, err := client.GetAllTagNames(context.Background())
+	if err != nil {
+		t.Fatalf("取り直しで回復しなかった: %v", err)
+	}
+	if len(tagNames) != 1 {
+		t.Errorf("タグ名 = %v, want 1件", tagNames)
+	}
+	if got := sessions.issuedCount(); got != 2 {
+		t.Errorf("セッションの発行回数 = %d, want 2 (取り直していない)", got)
+	}
+}
+
+// 既存タグの追加が 409 で返っても「成功」として扱えること。
+//
+// 再実行時や、手で消したタグを蘇らせない場面で必ず通る経路。
+// ここでステータスに打ち切られると、本物の失敗として扱われてしまう。
+func TestAddTagTreatsHTTP409AsAlreadyExist(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		writeJSONBody(t, w, map[string]any{
+			"errors":   []map[string]string{{"error_code": ErrCodeAlreadyExistTag, "error_message": "already exist"}},
+			"messages": nil,
+		})
+	}))
+
+	alreadyExist, err := client.AddTag(context.Background(), Tag{ID: "id-1", TargetID: "target-1", Tag: "タグA"})
+	if err != nil {
+		t.Fatalf("409 は成功扱いになるべき: %v", err)
+	}
+	if !alreadyExist {
+		t.Error("alreadyExist = false, want true")
+	}
+}
+
+// 非2xxでも本文の errors が APIError として読めること(業務エラーの一般形)。
+func TestNon200WithErrorsIsAPIError(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		writeJSONBody(t, w, map[string]any{
+			"errors":   []map[string]string{{"error_code": "ERR000410", "error_message": "検索に失敗しました"}},
+			"messages": nil,
+		})
+	}))
+
+	_, err := client.GetAllTagNames(context.Background())
+	if err == nil {
+		t.Fatal("500 はエラーになるべき")
+	}
+	var apiError *APIError
+	if !errors.As(err, &apiError) {
+		t.Fatalf("*APIError で返るべき(ステータスで打ち切っていないか確認): %v", err)
+	}
+	if !apiError.HasCode("ERR000410") {
+		t.Errorf("error_code が読めていない: %v", apiError)
+	}
+}
+
+// 本文が gkill 形式でない非2xxは、今までどおりステータス付きのエラーになること。
+func TestNon200WithoutEnvelopeIsPlainError(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("<html>Bad Gateway</html>"))
+	}))
+
+	_, err := client.GetAllTagNames(context.Background())
+	if err == nil {
+		t.Fatal("502 はエラーになるべき")
+	}
+	var apiError *APIError
+	if errors.As(err, &apiError) {
+		t.Fatalf("gkill 形式でない本文を APIError にしてはいけない: %v", err)
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("ステータスがエラー文に入っていない: %v", err)
 	}
 }
 
@@ -260,6 +367,7 @@ func TestAddTagSendsRelatedTimeAndAppName(t *testing.T) {
 	}
 }
 
+// 本文の無い 403（前段のフィルタに弾かれた場合）はローカル限定アクセスへ誘導する。
 func TestForbiddenMentionsLocalOnlyAccess(t *testing.T) {
 	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -269,9 +377,56 @@ func TestForbiddenMentionsLocalOnlyAccess(t *testing.T) {
 	if err == nil {
 		t.Fatal("エラーを期待したが nil")
 	}
-	// 403 の原因はほぼローカル限定アクセスなので、そこへ誘導する。
+	// 本文が読めない 403 の原因はほぼローカル限定アクセスなので、そこへ誘導する。
 	if !strings.Contains(err.Error(), "ローカル限定") {
 		t.Errorf("原因の手がかりがエラーに無い: %v", err)
+	}
+}
+
+// 本文つきの 403 でも、ローカル限定アクセスなら同じ案内が出ること。
+//
+// gkill は 2026-08 から、この拒否も本文つきで返すようになった(ADR-0045)。
+// 403 は認可の拒否全般にも使われるので、ステータスではなくコードで見分ける。
+func TestLocalOnlyAccessDeniedWithBodyStillGuides(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		writeJSONBody(t, w, map[string]any{
+			"errors": []map[string]string{
+				{"error_code": ErrCodeLocalOnlyAccessDenied, "error_message": "ローカルアクセスのみ許可されています"},
+			},
+			"messages": nil,
+		})
+	}))
+
+	_, err := client.GetAllTagNames(context.Background())
+	if err == nil {
+		t.Fatal("エラーを期待したが nil")
+	}
+	if !strings.Contains(err.Error(), "ローカル限定") {
+		t.Errorf("原因の手がかりがエラーに無い: %v", err)
+	}
+}
+
+// 管理者権限なしの 403 では、ローカル限定アクセスの案内を出さない（誤誘導になる）。
+func TestForbiddenByPermissionDoesNotMentionLocalOnly(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		writeJSONBody(t, w, map[string]any{
+			"errors": []map[string]string{
+				{"error_code": "ERR000014", "error_message": "権限がありません"},
+			},
+			"messages": nil,
+		})
+	}))
+
+	_, err := client.GetAllTagNames(context.Background())
+	if err == nil {
+		t.Fatal("エラーを期待したが nil")
+	}
+	if strings.Contains(err.Error(), "ローカル限定") {
+		t.Errorf("権限不足なのにローカル限定アクセスへ誘導している: %v", err)
 	}
 }
 

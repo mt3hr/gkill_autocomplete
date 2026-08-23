@@ -25,6 +25,13 @@ const (
 	// 決定的なIDを使うので、再実行時と「手で消したタグを蘇らせない」場面で
 	// 必ず出る。失敗ではなく「何もしなかった」として扱う。
 	ErrCodeAlreadyExistTag = "ERR000056"
+	// ErrCodeLocalOnlyAccessDenied はローカル限定アクセスによる拒否。
+	//
+	// gkill は 2026-08 から、この拒否も本文つきの 403 で返す(ADR-0045)。
+	// 以前は本文が空だったので「403 ならローカル限定」と決め打ちできたが、
+	// いまは 403 が認可の拒否全般(管理者権限なし・アカウント無効)にも使われる。
+	// コードで見分けて、直し方まで案内する。
+	ErrCodeLocalOnlyAccessDenied = "ERR000414"
 )
 
 // authErrorCodes は再ログインを試す価値のあるエラー。
@@ -49,7 +56,12 @@ func (e *APIError) Error() string {
 		}
 		formatted = append(formatted, gkillError.ErrorCode+": "+gkillError.ErrorMessage)
 	}
-	return fmt.Sprintf("gkill がエラーを返しました (%s): %s", e.Path, strings.Join(formatted, " / "))
+	message := fmt.Sprintf("gkill がエラーを返しました (%s): %s", e.Path, strings.Join(formatted, " / "))
+	if e.HasCode(ErrCodeLocalOnlyAccessDenied) {
+		// 何を直せばよいかまで書く。設定を知らないと原因にたどり着けない。
+		message += "\n  gkill 側でローカル限定アクセスが有効です。同じ端末からでないと通りません"
+	}
+	return message
 }
 
 // HasCode は指定のエラーコードが含まれるかを返す。
